@@ -12,7 +12,7 @@ platform = "github"
 
 [[dependencies]]
 name = "aiken-lang/stdlib"
-version = "v2.0.0"
+version = "v2.1.0"
 source = "github"
 
 [[dependencies]]

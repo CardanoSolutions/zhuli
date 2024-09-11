@@ -3,15 +3,14 @@ use aiken/collection/list
 use cardano/address.{Credential, Script}
 use cardano/assets.{PolicyId}
 use cardano/certificate.{
-  Certificate, DelegateCredential, RegisterAndDelegateCredential,
-  RegisterCredential, RegisterDelegateRepresentative, UnregisterCredential,
-  UnregisterDelegateRepresentative, UpdateDelegateRepresentative,
+  Certificate, RegisterDelegateRepresentative, UnregisterDelegateRepresentative,
+  UpdateDelegateRepresentative,
 }
 use cardano/credential/proxy.{
   must_be_approved_by_administrator, must_be_approved_by_delegate,
   must_forward_script, update_delegate,
 }
-use cardano/credential/proxy/state.{BlockProduction, Governance}
+use cardano/credential/proxy/state.{Governance}
 use cardano/governance.{DelegateRepresentative, Voter}
 use cardano/transaction.{Input, OutputReference, Transaction}
 use config
@@ -31,27 +30,25 @@ validator direct_proxy {
   // We fully bind the token's life to the delegate representative and thus, it must also be deleted when
   // upon de-registering the delegate. Hence, the presence of a matching `RegisterDelegateRepresentative` or
   // `UnregisterDelegateRepresentative` implies the execution of the `purpose` handler.
-  mint(_redeemer: Void, policy_id: PolicyId, self: Transaction) {
-    list.any(
-      self.certificates,
-      fn(certificate) {
-        when certificate is {
-          RegisterDelegateRepresentative {
-            delegate_representative: credential,
-            ..
-          } | 
-          UnregisterDelegateRepresentative {
-            delegate_representative: credential,
-            ..
-          } | 
-          RegisterCredential { credential, .. } | 
-          UnregisterCredential { credential, .. } | 
-          RegisterAndDelegateCredential { credential, .. } ->
-            credential == Script(policy_id)
-          _ -> False
-        }
-      },
-    )
+  mint(_redeemer: Data, policy_id: PolicyId, self: Transaction) {
+    let must_publish_certificates =
+      list.any(
+        self.certificates,
+        fn(certificate) {
+          when certificate is {
+            RegisterDelegateRepresentative {
+              delegate_representative: credential,
+              ..
+            } | 
+            UnregisterDelegateRepresentative {
+              delegate_representative: credential,
+              ..
+            } -> (credential == Script(policy_id))?
+            _ -> False
+          }
+        },
+      )
+    must_publish_certificates?
   }
 
   // The script is only useful as a stake credential. But it is also a trap for
@@ -69,22 +66,21 @@ validator direct_proxy {
     if (self.mint == assets.zero)? {
       // If there's no mint or burn, we allow forwarding the script to a
       // continuing output. This can only ever add Ada to the script.
-      must_forward_script(self, from, administrator)
+      must_forward_script(self, from, administrator)?
     } else {
       // Otherwise, we must necessarily be minting/burning one of the state
       // token. So it suffices to ensure that the minting handler is being
       // executed.
       expect Script(policy_id) = from.output.address.payment_credential
-      (assets.tokens(self.mint, policy_id) != dict.empty)?
+      let must_mint_or_burn_tokens =
+        assets.tokens(self.mint, policy_id) != dict.empty
+      must_mint_or_burn_tokens?
     }
   }
 
-  // Withdrawal of rewards are simply delegated to the hot block production delegate.
-  withdraw(rules: MultisigScript, account: Credential, self: Transaction) {
-    or {
-      must_be_approved_by_administrator(self, administrator),
-      must_be_approved_by_delegate(self, rules, account, BlockProduction),
-    }
+  // Withdrawal of rewards must be approved by the delegate
+  withdraw(_redeemer: Data, _account: Credential, self: Transaction) {
+    must_be_approved_by_administrator(self, administrator)
   }
 
   publish(
@@ -94,51 +90,19 @@ validator direct_proxy {
   ) {
     when certificate is {
       // The registration (resp. unregistration) of delegate credential for
-      // block production is the responsibility of the administrator  . As a
-      // proof of it happening properly, we issue (resp. burn) a token that is
-      // fully managed by the proxy script.
-      RegisterCredential { credential, .. } | 
-      RegisterAndDelegateCredential { credential, .. } -> and {
-          must_be_approved_by_administrator(self, administrator),
-          update_delegate(
-            self,
-            rules,
-            credential,
-            BlockProduction,
-            proxy.Register,
-          ),
-        }
-      UnregisterCredential { credential, .. } -> and {
-          must_be_approved_by_administrator(self, administrator),
-          update_delegate(
-            self,
-            rules,
-            credential,
-            BlockProduction,
-            proxy.Unregister,
-          ),
-        }
-
-      // The 'DelegateCredential' is the actual action that's being off-loaded
-      // to the `block_production_delegate`.
-      DelegateCredential { credential, .. } -> {
-        expect rules: MultisigScript = rules
-        must_be_approved_by_delegate(self, rules, credential, BlockProduction)
-      }
-
-      // The registration (resp. unregistration) of delegate credential for
       // governance is the responsibility of the administrator  . As a proof of
       // it happening properly, we issue (resp. burn) a token that is fully
       // managed by the proxy script.
       RegisterDelegateRepresentative { delegate_representative: delegate, .. } ->
         and {
-          must_be_approved_by_administrator(self, administrator),
-          update_delegate(self, rules, delegate, Governance, proxy.Register),
+          must_be_approved_by_administrator(self, administrator)?,
+          update_delegate(self, rules, delegate, Governance, proxy.Register)?,
         }
+
       UnregisterDelegateRepresentative { delegate_representative: delegate, .. } ->
         and {
-          must_be_approved_by_administrator(self, administrator),
-          update_delegate(self, rules, delegate, Governance, proxy.Unregister),
+          must_be_approved_by_administrator(self, administrator)?,
+          update_delegate(self, rules, delegate, Governance, proxy.Unregister)?,
         }
 
       // The UpdateDelegateRepresentative certificate is only used to update
@@ -146,11 +110,11 @@ validator direct_proxy {
       // responsibility to the governance delegate.
       UpdateDelegateRepresentative { delegate_representative: delegate } -> {
         expect rules: MultisigScript = rules
-        must_be_approved_by_delegate(self, rules, delegate, Governance)
+        must_be_approved_by_delegate(self, rules, delegate, Governance)?
       }
 
       // Stake pool related certificates are just considered invalid here.
-      _ -> fail
+      _ -> must_be_approved_by_administrator(self, administrator)?
     }
   }
 
