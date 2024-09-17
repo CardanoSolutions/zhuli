@@ -18,7 +18,7 @@ use sundae/multisig.{MultisigScript}
 
 const administrator: MultisigScript =
   multisig.AtLeast {
-    required: config.threshold,
+    required: config.quorum,
     scripts: list.map(config.administrators, multisig.Signature),
   }
 
@@ -39,7 +39,7 @@ validator direct_proxy {
             RegisterDelegateRepresentative {
               delegate_representative: credential,
               ..
-            } | 
+            } |
             UnregisterDelegateRepresentative {
               delegate_representative: credential,
               ..
@@ -79,8 +79,18 @@ validator direct_proxy {
   }
 
   // Withdrawal of rewards must be approved by the delegate
-  withdraw(_redeemer: Data, _account: Credential, self: Transaction) {
-    must_be_approved_by_administrator(self, administrator)
+  withdraw(
+    redeemer: Data<MultisigScript>,
+    account: Credential,
+    self: Transaction,
+  ) {
+    or {
+      must_be_approved_by_administrator(self, administrator)?,
+      {
+        expect rules: MultisigScript = redeemer
+        must_be_approved_by_delegate(self, rules, account, Governance)?
+      },
+    }
   }
 
   publish(

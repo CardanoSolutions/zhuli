@@ -1,6 +1,6 @@
 name = "cardanosolutions/proxy-dreps"
 version = "0.0.0"
-compiler = "v1.1.1"
+compiler = "v1.1.2"
 plutus = "v3"
 license = "MPL-2.0"
 description = "Aiken contracts for project 'cardanosolutions/proxy-dreps'"
@@ -26,13 +26,9 @@ version = "v2"
 source = "github"
 
 [config.default]
-threshold = 1 # How many administrors signatories are required to approve actions
+quorum = 1 # How many administrators signatories are required to approve actions
 
-# List of administators (verification key hashes)
+# List of administrators (verification key hashes)
 [[config.default.administrators]]
-bytes = "00000000000000000000000000000000000000000000000000000000"
-encoding = "base16"
-
-[[config.default.administrators]]
-bytes = "00000000000000000000000000000000000000000000000000000001"
+bytes = "491512406d99b03de5fa4d03ddd2b7f047eeb6681731916fb803f23d"
 encoding = "base16"
