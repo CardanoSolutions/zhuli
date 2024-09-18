@@ -9,18 +9,17 @@ use pallas_codec::{
 };
 use pallas_crypto::hash::{Hash, Hasher};
 use pallas_primitives::conway::{
-    AssetName, Certificate, Constr, ExUnits, Multiasset, NetworkId, PlutusData, PlutusV3Script,
-    PostAlonzoTransactionOutput, PseudoTransactionOutput, RedeemerTag, RedeemersKey,
-    RedeemersValue, StakeCredential, TransactionBody, TransactionInput, Tx, Value, WitnessSet,
+    AssetName, Certificate, Constr, ExUnits, Language, Multiasset, NetworkId, PlutusData,
+    PlutusV3Script, PostAlonzoTransactionOutput, PseudoTransactionOutput, RedeemerTag,
+    RedeemersKey, RedeemersValue, StakeCredential, TransactionBody, TransactionInput, Tx, Value,
+    WitnessSet,
 };
-use std::{num, str::FromStr};
+use std::{cmp::Ordering, num, str::FromStr};
 use uplc::tx::{eval_phase_two, ResolvedInput, SlotConfig};
 
 mod cardano;
 
 // ------------------------------------------------------------------ main ----
-
-const CONTRACT_LOCKED_FUND: u64 = 1_000_000;
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -31,6 +30,11 @@ async fn main() -> Result<(), Error> {
             let validator = hex::decode(args.get_one::<String>("validator").unwrap())
                 .map_err(|e| Error::FailedToDecodeHexString("validator", e))?
                 .into();
+
+            let contract = args
+                .get_one::<String>("contract")
+                .map(|s| s.parse())
+                .transpose()?;
 
             let administrators = args
                 .get_many::<String>("administrator")
@@ -54,7 +58,20 @@ async fn main() -> Result<(), Error> {
 
             let fuel = args.get_one::<String>("fuel").unwrap().parse()?;
 
-            report(delegate(network, validator, administrators, delegates, quorum, fuel).await?)
+            report(if let Some(contract) = contract {
+                redelegate(
+                    network,
+                    validator,
+                    contract,
+                    administrators,
+                    delegates,
+                    quorum,
+                    fuel,
+                )
+                .await?
+            } else {
+                delegate(network, validator, administrators, delegates, quorum, fuel).await?
+            })
         }
 
         Some(("vote", _)) => Ok(()),
@@ -138,32 +155,35 @@ async fn delegate(
     }];
 
     build_transaction(&params, resolved_inputs, |fee, ex_units| {
-        let execution_cost = total_execution_cost(&params, ex_units);
+        let (rules, asset_name) = build_rules(&delegates[..], quorum);
 
-        let total_cost = CONTRACT_LOCKED_FUND + params.drep_deposit + execution_cost as u64 + fee;
+        let contract_output =
+            new_min_value_output(params.min_utxo_deposit_coefficient, |lovelace| {
+                PostAlonzoTransactionOutput {
+                    address: validator_address.to_vec().into(),
+                    value: Value::Multiasset(
+                        lovelace,
+                        singleton_assets(
+                            validator_hash,
+                            &[(asset_name.clone(), PositiveCoin::try_from(1).unwrap())],
+                        ),
+                    ),
+                    datum_option: None,
+                    script_ref: None,
+                }
+            });
 
-        let total_collateral = (execution_cost as f64 * params.collateral_percent).ceil() as u64;
+        let total_collateral = (fee as f64 * params.collateral_percent).ceil() as u64;
 
         let mut redeemers = vec![];
 
         let inputs = vec![fuel.clone()];
 
-        let (rules, asset_name) = build_rules(&delegates[..], quorum);
+        let total_cost = params.drep_deposit + lovelace_of(&contract_output.value) + fee;
 
         let outputs = vec![
             // Contract
-            PostAlonzoTransactionOutput {
-                address: validator_address.to_vec().into(),
-                value: Value::Multiasset(
-                    CONTRACT_LOCKED_FUND,
-                    singleton_assets(
-                        validator_hash,
-                        &[(asset_name.clone(), PositiveCoin::try_from(1).unwrap())],
-                    ),
-                ),
-                datum_option: None,
-                script_ref: None,
-            },
+            contract_output,
             // Change
             PostAlonzoTransactionOutput {
                 address: fuel_output.address.clone(),
@@ -212,6 +232,7 @@ async fn delegate(
         ));
 
         // ----- Put it all together
+        let redeemers = NonEmptyKeyValuePairs::Def(redeemers);
         Tx {
             transaction_body: new_transaction_body(
                 network.network_id(),
@@ -222,6 +243,196 @@ async fn delegate(
                 (vec![fuel.clone()], collateral_return, total_collateral),
                 fee,
                 administrators.clone(),
+                script_integrity_hash(
+                    Some(&redeemers),
+                    None,
+                    &[(Language::PlutusV3, &params.cost_model_v3[..])],
+                )
+                .unwrap(),
+            ),
+            transaction_witness_set: new_witness_set(redeemers, validator.clone()),
+            success: true,
+            auxiliary_data: Nullable::Null,
+        }
+    })
+}
+
+async fn redelegate(
+    network: Cardano,
+    validator: Bytes,
+    OutputReference(contract): OutputReference,
+    administrators: Vec<Hash<28>>,
+    delegates: Vec<Hash<28>>,
+    quorum: usize,
+    OutputReference(fuel): OutputReference,
+) -> Result<Tx, Error> {
+    let (validator_hash, validator_address) =
+        from_validator(validator.as_ref(), network.network_id());
+
+    let params = network.protocol_parameters().await;
+
+    let contract_old_output = network
+        .resolve(&contract)
+        .await
+        .expect("failed to resolve contract UTxO");
+
+    let fuel_output = network
+        .resolve(&fuel)
+        .await
+        .expect("failed to resolve fuel UTxO");
+
+    let resolved_inputs = &[
+        ResolvedInput {
+            input: contract.clone(),
+            output: PseudoTransactionOutput::PostAlonzo(contract_old_output.clone()),
+        },
+        ResolvedInput {
+            input: fuel.clone(),
+            output: PseudoTransactionOutput::PostAlonzo(fuel_output.clone()),
+        },
+    ];
+
+    build_transaction(&params, resolved_inputs, |fee, ex_units| {
+        let (rules, new_asset_name) = build_rules(&delegates[..], quorum);
+
+        let old_asset_name = match &contract_old_output.value {
+            Value::Multiasset(_, ref assets) => assets
+                .first()
+                .and_then(|(_, assets)| assets.first().cloned()),
+            _ => None,
+        }
+        .expect("no state token in contract utxo?")
+        .0;
+
+        let contract_new_output =
+            new_min_value_output(params.min_utxo_deposit_coefficient, |lovelace| {
+                PostAlonzoTransactionOutput {
+                    address: validator_address.to_vec().into(),
+                    value: Value::Multiasset(
+                        lovelace,
+                        singleton_assets(
+                            validator_hash,
+                            &[(new_asset_name.clone(), PositiveCoin::try_from(1).unwrap())],
+                        ),
+                    ),
+                    datum_option: None,
+                    script_ref: None,
+                }
+            });
+
+        let total_collateral = (fee as f64 * params.collateral_percent).ceil() as u64;
+
+        let mut redeemers = vec![];
+
+        let mut inputs = vec![contract.clone(), fuel.clone()];
+        inputs.sort();
+
+        let total_cost =
+            lovelace_of(&contract_new_output.value) + fee - lovelace_of(&contract_old_output.value);
+
+        let mint = singleton_assets(
+            validator_hash,
+            &[
+                (new_asset_name, NonZeroInt::try_from(1).unwrap()),
+                (old_asset_name, NonZeroInt::try_from(-1).unwrap()),
+            ],
+        );
+        redeemers.push((
+            RedeemersKey {
+                tag: RedeemerTag::Mint,
+                index: 0,
+            },
+            RedeemersValue {
+                data: void(),
+                ex_units: ex_units[0],
+            },
+        ));
+
+        let outputs = vec![
+            // Contract
+            contract_new_output,
+            // Change
+            PostAlonzoTransactionOutput {
+                address: fuel_output.address.clone(),
+                value: subtract(fuel_output.value.clone(), total_cost).expect("not enough fuel"),
+                datum_option: None,
+                script_ref: None,
+            },
+        ];
+
+        let collateral_return = PostAlonzoTransactionOutput {
+            address: fuel_output.address.clone(),
+            value: subtract(fuel_output.value.clone(), total_collateral).expect("not enough fuel"),
+            datum_option: None,
+            script_ref: None,
+        };
+
+        redeemers.push((
+            RedeemersKey {
+                tag: RedeemerTag::Spend,
+                index: inputs
+                    .iter()
+                    .enumerate()
+                    .find(|(_, i)| *i == &contract)
+                    .unwrap()
+                    .0 as u32,
+            },
+            RedeemersValue {
+                data: void(),
+                ex_units: ex_units[1],
+            },
+        ));
+
+        let certificates = vec![
+            Certificate::UnRegDRepCert(
+                StakeCredential::Scripthash(validator_hash),
+                params.drep_deposit,
+            ),
+            Certificate::RegDRepCert(
+                StakeCredential::Scripthash(validator_hash),
+                params.drep_deposit,
+                Nullable::Null,
+            ),
+        ];
+        redeemers.push((
+            RedeemersKey {
+                tag: RedeemerTag::Cert,
+                index: 0,
+            },
+            RedeemersValue {
+                data: void(),
+                ex_units: ex_units[2],
+            },
+        ));
+        redeemers.push((
+            RedeemersKey {
+                tag: RedeemerTag::Cert,
+                index: 1,
+            },
+            RedeemersValue {
+                data: rules,
+                ex_units: ex_units[3],
+            },
+        ));
+
+        // ----- Put it all together
+        let redeemers = NonEmptyKeyValuePairs::Def(redeemers);
+        Tx {
+            transaction_body: new_transaction_body(
+                network.network_id(),
+                inputs,
+                outputs,
+                mint,
+                certificates,
+                (vec![fuel.clone()], collateral_return, total_collateral),
+                fee,
+                administrators.clone(),
+                script_integrity_hash(
+                    Some(&redeemers),
+                    None,
+                    &[(Language::PlutusV3, &params.cost_model_v3[..])],
+                )
+                .unwrap(),
             ),
             transaction_witness_set: new_witness_set(redeemers, validator.clone()),
             success: true,
@@ -241,21 +452,30 @@ fn build_transaction<E, F>(
 where
     F: Fn(u64, &[ExUnits]) -> Tx,
 {
+    let empty_ex_units = || {
+        vec![
+            ExUnits { mem: 0, steps: 0 },
+            ExUnits { mem: 0, steps: 0 },
+            ExUnits { mem: 0, steps: 0 },
+            ExUnits { mem: 0, steps: 0 },
+        ]
+    };
+
     let mut fee = 0;
-    let mut ex_units = vec![ExUnits { mem: 0, steps: 0 }, ExUnits { mem: 0, steps: 0 }];
+    let mut ex_units = empty_ex_units();
 
     let mut tx;
-
+    let mut attempts = 0;
     loop {
         tx = with(fee, &ex_units[..]);
 
         // Convert to minted_tx...
-        let mut buffer = Vec::new();
-        cbor::encode(&tx, &mut buffer).unwrap();
-        let minted_tx = cbor::decode(&buffer).unwrap();
+        let mut serialized_tx = Vec::new();
+        cbor::encode(&tx, &mut serialized_tx).unwrap();
+        let minted_tx = cbor::decode(&serialized_tx).unwrap();
 
         // Compute execution units
-        let calculated_ex_units = eval_phase_two(
+        let mut calculated_ex_units = eval_phase_two(
             &minted_tx,
             resolved_inputs,
             None,
@@ -269,12 +489,41 @@ where
         .map(|r| r.ex_units)
         .collect::<Vec<_>>();
 
+        calculated_ex_units.extend(empty_ex_units());
+
+        attempts += 1;
+
         // Check if we've reached a fixed point, or start over.
-        if calculated_ex_units == ex_units {
+        if calculated_ex_units
+            .iter()
+            .zip(ex_units)
+            .all(|(l, r)| l.eq(&r))
+        {
             break;
+        } else if attempts >= 3 {
+            panic!("failed to build transaction: did not converge after three attempts.");
         } else {
             ex_units = calculated_ex_units;
-            fee = buffer.len() as u64 * params.fee_coefficient + params.fee_constant;
+
+            // NOTE: This is a best effort to estimate the number of signatories since signatures
+            // will add an overhead to the fee. Yet, if inputs are locked by native scripts each
+            // requiring multiple signatories, this will unfortunately fall short.
+            //
+            // For similar reasons, it will also over-estimate fees by a small margin for every
+            // script-locked inputs that do not require signatories.
+            //
+            // This is however *acceptable* in our context.
+            let num_signatories = tx.transaction_body.inputs.len()
+                + tx.transaction_body
+                    .required_signers
+                    .map(|ref xs| xs.len())
+                    .unwrap_or(0);
+
+            fee = params.fee_constant
+                + params.fee_coefficient
+                    * (5 + ex_units.len() * 16 + num_signatories * 102 + serialized_tx.len())
+                        as u64
+                + total_execution_cost(params, &ex_units);
         }
     }
 
@@ -381,6 +630,7 @@ fn new_transaction_body(
     ),
     fee: u64,
     extra_signatories: Vec<Hash<28>>,
+    script_data_hash: Hash<32>,
 ) -> TransactionBody {
     TransactionBody {
         inputs: Set::from(inputs),
@@ -400,9 +650,8 @@ fn new_transaction_body(
             Network::Mainnet => NetworkId::Two,
             _ => NetworkId::One,
         }),
-        // TODO ---------------
-        script_data_hash: None,
-        // --------------------
+        script_data_hash: Some(script_data_hash),
+        // --------------------------------------
         ttl: None,
         validity_interval_start: None,
         withdrawals: None,
@@ -414,14 +663,17 @@ fn new_transaction_body(
     }
 }
 
-fn new_witness_set(redeemers: Vec<(RedeemersKey, RedeemersValue)>, validator: Bytes) -> WitnessSet {
+fn new_witness_set(
+    redeemers: NonEmptyKeyValuePairs<RedeemersKey, RedeemersValue>,
+    validator: Bytes,
+) -> WitnessSet {
     WitnessSet {
         vkeywitness: None,
         native_script: None,
         bootstrap_witness: None,
         plutus_v1_script: None,
         plutus_data: None,
-        redeemer: Some(NonEmptyKeyValuePairs::Def(redeemers).into()),
+        redeemer: Some(redeemers.into()),
         plutus_v2_script: None,
         plutus_v3_script: Some(NonEmptySet::try_from(vec![PlutusV3Script(validator)]).unwrap()),
     }
@@ -498,9 +750,69 @@ fn subtract(total_value: Value, total_cost: u64) -> Option<Value> {
     }
 }
 
+fn lovelace_of(value: &Value) -> u64 {
+    match value {
+        Value::Coin(lovelace) | Value::Multiasset(lovelace, _) => *lovelace,
+    }
+}
+
+// Move to Pallas somewhere.
+fn new_min_value_output<F>(per_byte: u64, build: F) -> PostAlonzoTransactionOutput
+where
+    F: Fn(u64) -> PostAlonzoTransactionOutput,
+{
+    let value = build(1);
+    let mut buffer: Vec<u8> = Vec::new();
+    cbor::encode(&value, &mut buffer).unwrap();
+    // NOTE: 160 overhead as per the spec + 4 bytes for actual final lovelace value.
+    // Technically, the final value could need 8 more additional bytes if the resulting
+    // value was larger than 4_294_967_295 lovelaces, which would realistically never be
+    // the case.
+    build((buffer.len() as u64 + 164) * per_byte)
+}
+
 fn total_execution_cost(params: &ProtocolParameters, redeemers: &[ExUnits]) -> u64 {
     redeemers.iter().fold(0, |acc, ex_units| {
         acc + ((params.price_mem * ex_units.mem as f64).ceil() as u64)
             + ((params.price_steps * ex_units.steps as f64).ceil() as u64)
     })
+}
+
+fn script_integrity_hash(
+    redeemers: Option<&NonEmptyKeyValuePairs<RedeemersKey, RedeemersValue>>,
+    datums: Option<&NonEmptyKeyValuePairs<Hash<32>, PlutusData>>,
+    language_views: &[(Language, &[i64])],
+) -> Option<Hash<32>> {
+    if redeemers.is_none() && language_views.is_empty() && datums.is_none() {
+        return None;
+    }
+
+    let mut preimage: Vec<u8> = Vec::new();
+    if let Some(redeemers) = redeemers {
+        cbor::encode(redeemers, &mut preimage).unwrap();
+    }
+
+    if let Some(datums) = datums {
+        cbor::encode(datums, &mut preimage).unwrap();
+    }
+
+    // NOTE: This doesn't work for PlutusV1, but I don't care.
+    if !language_views.is_empty() {
+        let mut views = language_views.to_vec();
+        // TODO: Derive an Ord instance in Pallas.
+        views.sort_by(|(a, _), (b, _)| match (a, b) {
+            (Language::PlutusV3, Language::PlutusV3) => Ordering::Equal,
+            (Language::PlutusV3, _) => Ordering::Greater,
+            (_, Language::PlutusV3) => Ordering::Less,
+
+            (Language::PlutusV2, Language::PlutusV2) => Ordering::Equal,
+            (Language::PlutusV2, _) => Ordering::Greater,
+            (_, Language::PlutusV2) => Ordering::Less,
+
+            (Language::PlutusV1, Language::PlutusV1) => Ordering::Equal,
+        });
+        cbor::encode(NonEmptyKeyValuePairs::Def(views), &mut preimage).unwrap()
+    }
+
+    Some(Hasher::<256>::hash(&preimage))
 }
