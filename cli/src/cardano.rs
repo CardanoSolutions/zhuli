@@ -1,20 +1,26 @@
-use blockfrost::BlockfrostAPI;
-use blockfrost_openapi::models::tx_content_output_amount_inner::TxContentOutputAmountInner;
+use blockfrost::{BlockfrostAPI, Pagination};
+use blockfrost_openapi::models::{
+    asset_history_inner::Action, tx_content_output_amount_inner::TxContentOutputAmountInner,
+};
 use pallas_addresses::Network;
-use pallas_codec::utils::NonEmptyKeyValuePairs;
+use pallas_codec::{minicbor as cbor, utils::NonEmptyKeyValuePairs};
 use pallas_primitives::conway::{
-    AssetName, PolicyId, PostAlonzoTransactionOutput, TransactionInput, Value,
+    AssetName, PolicyId, PostAlonzoTransactionOutput, TransactionInput, Tx, Value,
 };
 use std::{collections::BTreeMap, env};
 
 pub struct Cardano {
     api: BlockfrostAPI,
     network: Network,
+    network_prefix: String,
+    project_id: String,
 }
 
 const UNIT_LOVELACE: &str = "lovelace";
 
 const MAINNET_PREFIX: &str = "mainnet";
+const PREPROD_PREFIX: &str = "preprod";
+const PREVIEW_PREFIX: &str = "preview";
 
 const ENV_PROJECT_ID: &str = "BLOCKFROST_PROJECT_ID";
 
@@ -42,6 +48,16 @@ impl Cardano {
             } else {
                 Network::Testnet
             },
+            network_prefix: if project_id.starts_with(MAINNET_PREFIX) {
+                MAINNET_PREFIX.to_string()
+            } else if project_id.starts_with(PREPROD_PREFIX) {
+                PREPROD_PREFIX.to_string()
+            } else if project_id.starts_with(PREVIEW_PREFIX) {
+                PREVIEW_PREFIX.to_string()
+            } else {
+                panic!("unexpected project id prefix")
+            },
+            project_id,
         }
     }
 
@@ -104,6 +120,56 @@ impl Cardano {
         }
     }
 
+    pub async fn minting(&self, policy_id: &PolicyId, asset_name: &AssetName) -> Vec<Tx> {
+        let history = self
+            .api
+            .assets_history(
+                &format!("{}{}", hex::encode(policy_id), hex::encode(&asset_name[..])),
+                Pagination::all(),
+            )
+            .await
+            .ok()
+            .unwrap_or(vec![])
+            .into_iter()
+            .filter_map(|inner| {
+                if matches!(inner.action, Action::Minted) {
+                    Some(inner.tx_hash)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let client = reqwest::Client::new();
+
+        let mut txs: Vec<Tx> = vec![];
+        for tx_hash in history {
+            // NOTE: Not part of the Rust SDK somehow...
+            let response = client
+                .get(&format!(
+                    "https://cardano-{}.blockfrost.io/api/v0/txs/{}/cbor",
+                    self.network_prefix, tx_hash
+                ))
+                .header("Accept", "application/json")
+                .header("project_id", self.project_id.as_str())
+                .send()
+                .await
+                .unwrap();
+            match response.status() {
+                reqwest::StatusCode::OK => {
+                    let TxByHash { cbor } = response.json::<TxByHash>().await.unwrap();
+                    let tx = cbor::decode(&hex::decode(cbor).unwrap()).unwrap();
+                    txs.push(tx);
+                }
+                status => {
+                    panic!("unexpected response status from Blockfrost: {}", status);
+                }
+            };
+        }
+
+        txs
+    }
+
     pub async fn resolve(&self, input: &TransactionInput) -> Option<PostAlonzoTransactionOutput> {
         let utxo = self
             .api
@@ -139,6 +205,11 @@ impl Cardano {
                 }
             })
     }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+struct TxByHash {
+    cbor: String,
 }
 
 fn from_bech32(bech32: &str) -> Vec<u8> {

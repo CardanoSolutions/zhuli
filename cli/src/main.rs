@@ -1,18 +1,20 @@
 use crate::cardano::ProtocolParameters;
 use cardano::Cardano;
-use clap::{Arg, ArgAction, Command};
-use indoc::printdoc;
-use pallas_addresses::{Network, ShelleyAddress, ShelleyDelegationPart, ShelleyPaymentPart};
+use clap::{Arg, ArgAction, ArgGroup, Command};
+use indoc::{indoc, printdoc};
+use pallas_addresses::{
+    Address, Network, ShelleyAddress, ShelleyDelegationPart, ShelleyPaymentPart,
+};
 use pallas_codec::{
     minicbor as cbor,
     utils::{Bytes, NonEmptyKeyValuePairs, NonEmptySet, NonZeroInt, Nullable, PositiveCoin, Set},
 };
 use pallas_crypto::hash::{Hash, Hasher};
 use pallas_primitives::conway::{
-    AssetName, Certificate, Constr, ExUnits, Language, Multiasset, NetworkId, PlutusData,
-    PlutusV3Script, PostAlonzoTransactionOutput, PseudoTransactionOutput, RedeemerTag,
-    RedeemersKey, RedeemersValue, StakeCredential, TransactionBody, TransactionInput, Tx, Value,
-    WitnessSet,
+    Anchor, AssetName, Certificate, Constr, DRep, ExUnits, GovActionId, Language, Multiasset,
+    NetworkId, PlutusData, PlutusV3Script, PostAlonzoTransactionOutput, PseudoTransactionOutput,
+    RedeemerTag, RedeemersKey, RedeemersValue, StakeCredential, TransactionBody, TransactionInput,
+    Tx, Value, Vote, Voter, VotingProcedure, WitnessSet,
 };
 use std::{cmp::Ordering, num, str::FromStr};
 use uplc::tx::{eval_phase_two, ResolvedInput, SlotConfig};
@@ -26,6 +28,16 @@ async fn main() -> Result<(), Error> {
     let network = Cardano::new();
 
     match cli().get_matches().subcommand() {
+        Some(("assign-stake", args)) => {
+            let validator = hex::decode(args.get_one::<String>("validator").unwrap())
+                .map_err(|e| Error::FailedToDecodeHexString("validator", e))?
+                .into();
+
+            let fuel = args.get_one::<String>("fuel").unwrap().parse()?;
+
+            report(assign_stake(network, validator, fuel).await?)
+        }
+
         Some(("delegate", args)) => {
             let validator = hex::decode(args.get_one::<String>("validator").unwrap())
                 .map_err(|e| Error::FailedToDecodeHexString("validator", e))?
@@ -62,10 +74,10 @@ async fn main() -> Result<(), Error> {
                 redelegate(
                     network,
                     validator,
-                    contract,
                     administrators,
                     delegates,
                     quorum,
+                    contract,
                     fuel,
                 )
                 .await?
@@ -74,7 +86,51 @@ async fn main() -> Result<(), Error> {
             })
         }
 
-        Some(("vote", _)) => Ok(()),
+        Some(("vote", args)) => {
+            let validator = hex::decode(args.get_one::<String>("validator").unwrap())
+                .map_err(|e| Error::FailedToDecodeHexString("validator", e))?
+                .into();
+
+            let delegates = args
+                .get_many::<String>("delegate")
+                .unwrap_or_default()
+                .map(|delegate| delegate.parse())
+                .collect::<Result<Vec<Hash<28>>, _>>()
+                .map_err(|e| Error::FailedToDecodeHexString("delegate", e))?;
+
+            let choice = match args.get_one::<clap::Id>("vote").unwrap().as_str() {
+                "yes" => Vote::Yes,
+                "no" => Vote::No,
+                "abstain" => Vote::Abstain,
+                _ => unreachable!(),
+            };
+
+            let anchor = args.get_one::<String>("anchor").map(|s| s.as_str());
+
+            let OutputReference(utxo_like) = args.get_one::<String>("proposal").unwrap().parse()?;
+            let proposal_id = GovActionId {
+                transaction_id: utxo_like.transaction_id,
+                action_index: utxo_like.index as u32,
+            };
+
+            let contract = args.get_one::<String>("contract").unwrap().parse()?;
+
+            let fuel = args.get_one::<String>("fuel").unwrap().parse()?;
+
+            report(
+                vote(
+                    network,
+                    validator,
+                    delegates,
+                    choice,
+                    anchor,
+                    proposal_id,
+                    contract,
+                    fuel,
+                )
+                .await?,
+            )
+        }
 
         Some(("revoke", _)) => Ok(()),
 
@@ -115,6 +171,163 @@ enum Error {
     FailedToDecodeInt(&'static str, num::ParseIntError),
 }
 
+// ------------------------------------------------------------------- cli ----
+
+fn cli() -> Command {
+    Command::new("Hot/Cold DRep Management")
+        .version("1.0.0")
+        .about("A toolkit providing hot/cold account management for delegate representatives on Cardano.
+This command-line serves as a transaction builder various steps of the contract.")
+        .subcommand(
+            Command::new("vote")
+                .about("Vote on a governance action.")
+                .arg(arg_contract(true))
+                .arg(arg_validator())
+                .arg(arg_delegate())
+                .arg(arg_fuel())
+                .arg(arg_proposal())
+                .arg(arg_anchor())
+                .arg(flag_yes())
+                .arg(flag_no())
+                .arg(flag_abstain())
+                .group(arg_vote())
+        )
+        .subcommand(
+            Command::new("delegate")
+                .about(indoc! {
+                    r#"Hand-over voting rights to a delegate script. The --contract option is only mandatory for re-delegation (as it typically doesn't exist otherwise).
+                       Also, the specified --administrator must reflect the signatories for the transaction, but not necessarily ALL administrators. Only those authorizing
+                       the transaction must be present. And, there must be enough signatories for a quorum."#
+                })
+                .arg(arg_validator())
+                .arg(arg_delegate())
+                .arg(arg_administrator())
+                .arg(arg_quorum())
+                .arg(arg_contract(false))
+                .arg(arg_fuel())
+        )
+        .subcommand(
+            Command::new("assign-stake")
+                .about(indoc! {
+                    r#"Assign all stake from the fuel input to the DRep contract. This command exists mainly for testing purposes, as an easy way to get some stake into
+                       the DRep."#
+                })
+                .arg(arg_validator())
+                .arg(arg_fuel())
+        )
+        .subcommand(
+            Command::new("revoke")
+                .about("Revoke delegation, without defining a new delegate.")
+        )
+}
+
+// ------------------------------------------------------------- arguments ----
+
+fn arg_validator() -> Arg {
+    Arg::new("validator")
+        .long("validator")
+        .short('v')
+        .value_name("HEX_STRING")
+        .help("The compiled validator code, hex-encoded. (e.g jq -r '.validators[0].compiledCode' plutus.json)")
+        .action(ArgAction::Set)
+}
+
+fn arg_anchor() -> Arg {
+    Arg::new("anchor")
+        .long("anchor")
+        .short('a')
+        .value_name("URL")
+        .help("An (optional) URL to an anchor file containing rationale for the vote.")
+        .action(ArgAction::Set)
+}
+
+fn arg_vote() -> ArgGroup {
+    ArgGroup::new("vote")
+        .args(["yes", "no", "abstain"])
+        .multiple(true)
+        .required(true)
+}
+
+fn flag_yes() -> Arg {
+    Arg::new("yes")
+        .short('y')
+        .long("yes")
+        .help("Approve the governance proposal")
+        .action(ArgAction::SetTrue)
+}
+
+fn flag_no() -> Arg {
+    Arg::new("no")
+        .short('n')
+        .long("no")
+        .help("Reject the governance proposal")
+        .action(ArgAction::SetTrue)
+}
+
+fn flag_abstain() -> Arg {
+    Arg::new("abstain")
+        .long("abstain")
+        .help("Abstain from the governance proposal voting")
+        .action(ArgAction::SetTrue)
+}
+
+fn arg_contract(required: bool) -> Arg {
+    Arg::new("contract")
+        .long("contract")
+        .short('c')
+        .value_name("TX_ID#IX")
+        .help("The UTxO holding the contract's state.")
+        .required(required)
+        .action(ArgAction::Set)
+}
+
+fn arg_fuel() -> Arg {
+    Arg::new("fuel")
+        .long("fuel")
+        .short('f')
+        .required(true)
+        .value_name("TX_ID#IX")
+        .help("A UTxO to use as fuel for the transaction. Must be suitable for collateral use.")
+        .action(ArgAction::Set)
+}
+
+fn arg_proposal() -> Arg {
+    Arg::new("proposal")
+        .long("proposal")
+        .short('p')
+        .required(true)
+        .value_name("TX_ID#IX")
+        .help("The proposal procedure identifier that's being voted on.")
+        .action(ArgAction::Set)
+}
+
+fn arg_delegate() -> Arg {
+    Arg::new("delegate")
+        .long("delegate")
+        .short('s')
+        .value_name("HEX_STRING")
+        .help("Verification key hash digest (blake2b-228) of a delegate signatory. Use multiple times for multiple delegates.")
+        .action(ArgAction::Append)
+}
+
+fn arg_administrator() -> Arg {
+    Arg::new("administrator")
+        .long("administrator")
+        .short('a')
+        .value_name("HEX_STRING")
+        .help("Verification key hash digest (blake2b-228) of an admin signatory. Use multiple times for multiple admins.")
+        .action(ArgAction::Append)
+}
+
+fn arg_quorum() -> Arg {
+    Arg::new("quorum")
+        .long("quorum")
+        .short('q')
+        .value_name("UINT")
+        .help("Minimum number of delegates to authorize votes. Default to the total number of delegates (plenum).")
+        .action(ArgAction::Set)
+}
+
 // -------------------------------------------------------------- commands ----
 
 fn report<E>(tx: Tx) -> Result<(), E> {
@@ -129,6 +342,71 @@ fn report<E>(tx: Tx) -> Result<(), E> {
         hex::encode(&buf),
     };
     Ok(())
+}
+
+async fn assign_stake(
+    network: Cardano,
+    validator: Bytes,
+    OutputReference(fuel): OutputReference,
+) -> Result<Tx, Error> {
+    let (validator_hash, _) = from_validator(validator.as_ref(), network.network_id());
+
+    let params = network.protocol_parameters().await;
+
+    let fuel_output = network
+        .resolve(&fuel)
+        .await
+        .expect("failed to resolve fuel UTxO");
+
+    build_transaction(&params, &[], |fee, _| {
+        let inputs = vec![fuel.clone()];
+
+        let (vkh, address) =
+            if let Ok(Address::Shelley(src)) = Address::from_bytes(&fuel_output.address) {
+                let payment_part = src.payment().clone();
+                let (vkh, delegation_part) = match payment_part {
+                    ShelleyPaymentPart::Key(vkh) => (vkh, ShelleyDelegationPart::Key(vkh)),
+                    ShelleyPaymentPart::Script(..) => unreachable!(),
+                };
+                (
+                    vkh,
+                    ShelleyAddress::new(src.network(), payment_part, delegation_part),
+                )
+            } else {
+                unreachable!();
+            };
+
+        let total_cost = fee + 2_000_000;
+
+        let outputs = vec![PostAlonzoTransactionOutput {
+            address: address.to_vec().into(),
+            value: subtract(fuel_output.value.clone(), total_cost).expect("not enough fuel"),
+            datum_option: None,
+            script_ref: None,
+        }];
+
+        let certificates = vec![Certificate::VoteRegDeleg(
+            StakeCredential::AddrKeyhash(vkh),
+            DRep::Script(validator_hash),
+            2_000_000,
+        )];
+
+        Tx {
+            transaction_body: TransactionBody {
+                inputs: Set::from(inputs),
+                outputs: outputs
+                    .into_iter()
+                    .map(PseudoTransactionOutput::PostAlonzo)
+                    .collect(),
+                fee,
+                certificates: Some(NonEmptySet::try_from(certificates).unwrap()),
+                ..default_transaction_body()
+            },
+            transaction_witness_set: default_witness_set(),
+            success: true,
+            auxiliary_data: Nullable::Null,
+        }
+    })
 }
 
 async fn delegate(
@@ -237,9 +515,11 @@ async fn delegate(
             transaction_body: new_transaction_body(
                 network.network_id(),
                 inputs,
+                vec![],
                 outputs,
-                mint,
+                Some(mint),
                 certificates,
+                vec![],
                 (vec![fuel.clone()], collateral_return, total_collateral),
                 fee,
                 administrators.clone(),
@@ -260,10 +540,10 @@ async fn delegate(
 async fn redelegate(
     network: Cardano,
     validator: Bytes,
-    OutputReference(contract): OutputReference,
     administrators: Vec<Hash<28>>,
     delegates: Vec<Hash<28>>,
     quorum: usize,
+    OutputReference(contract): OutputReference,
     OutputReference(fuel): OutputReference,
 ) -> Result<Tx, Error> {
     let (validator_hash, validator_address) =
@@ -295,14 +575,8 @@ async fn redelegate(
     build_transaction(&params, resolved_inputs, |fee, ex_units| {
         let (rules, new_asset_name) = build_rules(&delegates[..], quorum);
 
-        let old_asset_name = match &contract_old_output.value {
-            Value::Multiasset(_, ref assets) => assets
-                .first()
-                .and_then(|(_, assets)| assets.first().cloned()),
-            _ => None,
-        }
-        .expect("no state token in contract utxo?")
-        .0;
+        let old_asset_name = find_contract_token(&contract_old_output.value)
+            .expect("no state token in contract utxo?");
 
         let contract_new_output =
             new_min_value_output(params.min_utxo_deposit_coefficient, |lovelace| {
@@ -421,12 +695,145 @@ async fn redelegate(
             transaction_body: new_transaction_body(
                 network.network_id(),
                 inputs,
+                vec![],
                 outputs,
-                mint,
+                Some(mint),
                 certificates,
+                vec![],
                 (vec![fuel.clone()], collateral_return, total_collateral),
                 fee,
                 administrators.clone(),
+                script_integrity_hash(
+                    Some(&redeemers),
+                    None,
+                    &[(Language::PlutusV3, &params.cost_model_v3[..])],
+                )
+                .unwrap(),
+            ),
+            transaction_witness_set: new_witness_set(redeemers, validator.clone()),
+            success: true,
+            auxiliary_data: Nullable::Null,
+        }
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn vote(
+    network: Cardano,
+    validator: Bytes,
+    delegates: Vec<Hash<28>>,
+    choice: Vote,
+    anchor: Option<&str>,
+    proposal_id: GovActionId,
+    OutputReference(contract): OutputReference,
+    OutputReference(fuel): OutputReference,
+) -> Result<Tx, Error> {
+    let (validator_hash, _) = from_validator(validator.as_ref(), network.network_id());
+
+    let params = network.protocol_parameters().await;
+
+    let contract_output = network
+        .resolve(&contract)
+        .await
+        .expect("failed to resolve contract UTxO");
+
+    let fuel_output = network
+        .resolve(&fuel)
+        .await
+        .expect("failed to resolve fuel UTxO");
+
+    let resolved_inputs = &[
+        ResolvedInput {
+            input: contract.clone(),
+            output: PseudoTransactionOutput::PostAlonzo(contract_output.clone()),
+        },
+        ResolvedInput {
+            input: fuel.clone(),
+            output: PseudoTransactionOutput::PostAlonzo(fuel_output.clone()),
+        },
+    ];
+
+    let (rules, _) = recover_rules(&network, &validator_hash, &contract_output.value).await;
+
+    let anchor = if let Some(url) = anchor {
+        let response = reqwest::get(url)
+            .await
+            .expect("failed to fetch anchor at URL: {url}");
+        match response.status() {
+            status if status.is_success() => {
+                let content_hash = Hasher::<256>::hash(response.bytes().await.unwrap().as_ref());
+                Some(Anchor {
+                    url: url.to_string(),
+                    content_hash,
+                })
+            }
+            status => panic!("failed to fetch anchor content, server said: {status:?}"),
+        }
+    } else {
+        None
+    };
+
+    build_transaction(&params, resolved_inputs, |fee, ex_units| {
+        let mut redeemers = vec![];
+
+        let inputs = vec![fuel.clone()];
+
+        let reference_inputs = vec![contract.clone()];
+
+        let outputs = vec![
+            // Change
+            PostAlonzoTransactionOutput {
+                address: fuel_output.address.clone(),
+                value: subtract(fuel_output.value.clone(), fee).expect("not enough fuel"),
+                datum_option: None,
+                script_ref: None,
+            },
+        ];
+
+        let total_collateral = (fee as f64 * params.collateral_percent).ceil() as u64;
+
+        let collateral_return = PostAlonzoTransactionOutput {
+            address: fuel_output.address.clone(),
+            value: subtract(fuel_output.value.clone(), total_collateral).expect("not enough fuel"),
+            datum_option: None,
+            script_ref: None,
+        };
+
+        let votes = vec![(
+            Voter::DRepScript(validator_hash),
+            NonEmptyKeyValuePairs::Def(vec![(
+                proposal_id.clone(),
+                VotingProcedure {
+                    vote: choice.clone(),
+                    anchor: anchor.clone().map(Nullable::Some).unwrap_or(Nullable::Null),
+                },
+            )]),
+        )];
+        redeemers.push((
+            RedeemersKey {
+                tag: RedeemerTag::Vote,
+                index: 0,
+            },
+            RedeemersValue {
+                data: rules.clone(),
+                ex_units: ex_units[0],
+            },
+        ));
+
+        // ----- Put it all together
+        let redeemers = NonEmptyKeyValuePairs::Def(redeemers);
+        Tx {
+            transaction_body: new_transaction_body(
+                network.network_id(),
+                inputs,
+                reference_inputs,
+                outputs,
+                None,
+                vec![],
+                votes,
+                (vec![fuel.clone()], collateral_return, total_collateral),
+                fee,
+                delegates.clone(),
                 script_integrity_hash(
                     Some(&redeemers),
                     None,
@@ -472,39 +879,32 @@ where
         // Convert to minted_tx...
         let mut serialized_tx = Vec::new();
         cbor::encode(&tx, &mut serialized_tx).unwrap();
-        let minted_tx = cbor::decode(&serialized_tx).unwrap();
 
-        // Compute execution units
-        let mut calculated_ex_units = eval_phase_two(
-            &minted_tx,
-            resolved_inputs,
-            None,
-            None,
-            &SlotConfig::default(),
-            false,
-            |_| (),
-        )
-        .expect("script evaluation failed")
-        .into_iter()
-        .map(|r| r.ex_units)
-        .collect::<Vec<_>>();
+        let mut calculated_ex_units = if resolved_inputs.is_empty() {
+            empty_ex_units()
+        } else {
+            // Compute execution units
+            let minted_tx = cbor::decode(&serialized_tx).unwrap();
+            eval_phase_two(
+                &minted_tx,
+                resolved_inputs,
+                None,
+                None,
+                &SlotConfig::default(),
+                false,
+                |_| (),
+            )
+            .expect("script evaluation failed")
+            .into_iter()
+            .map(|r| r.ex_units)
+            .collect::<Vec<_>>()
+        };
 
         calculated_ex_units.extend(empty_ex_units());
 
         attempts += 1;
 
-        // Check if we've reached a fixed point, or start over.
-        if calculated_ex_units
-            .iter()
-            .zip(ex_units)
-            .all(|(l, r)| l.eq(&r))
-        {
-            break;
-        } else if attempts >= 3 {
-            panic!("failed to build transaction: did not converge after three attempts.");
-        } else {
-            ex_units = calculated_ex_units;
-
+        let estimated_fee = {
             // NOTE: This is a best effort to estimate the number of signatories since signatures
             // will add an overhead to the fee. Yet, if inputs are locked by native scripts each
             // requiring multiple signatories, this will unfortunately fall short.
@@ -516,113 +916,84 @@ where
             let num_signatories = tx.transaction_body.inputs.len()
                 + tx.transaction_body
                     .required_signers
-                    .map(|ref xs| xs.len())
+                    .as_ref()
+                    .map(|xs| xs.len())
                     .unwrap_or(0);
 
-            fee = params.fee_constant
+            params.fee_constant
                 + params.fee_coefficient
-                    * (5 + ex_units.len() * 16 + num_signatories * 102 + serialized_tx.len())
-                        as u64
-                + total_execution_cost(params, &ex_units);
+                    * (5 + ex_units.len() * 16 + num_signatories * 102 + serialized_tx.len()) as u64
+                + total_execution_cost(params, &ex_units)
+        };
+
+        // Check if we've reached a fixed point, or start over.
+        if fee >= estimated_fee
+            && calculated_ex_units
+                .iter()
+                .zip(ex_units)
+                .all(|(l, r)| l.eq(&r))
+        {
+            break;
+        } else if attempts >= 3 {
+            panic!("failed to build transaction: did not converge after three attempts.");
+        } else {
+            ex_units = calculated_ex_units;
+            fee = estimated_fee;
         }
     }
 
     Ok(tx)
 }
 
-// ------------------------------------------------------------------- cli ----
-
-fn cli() -> Command {
-    Command::new("Hot/Cold DRep Management")
-        .version("1.0.0")
-        .about("A toolkit providing hot/cold account management for delegate representatives on Cardano.
-This command-line serves as a transaction builder various steps of the contract.")
-        .subcommand(
-            Command::new("vote")
-                .about("Vote on a governance action")
-        )
-        .subcommand(
-            Command::new("delegate")
-                .about("Hand-over voting rights to a delegate script.")
-                .arg(arg_validator())
-                .arg(arg_delegate())
-                .arg(arg_administrator())
-                .arg(arg_quorum())
-                .arg(arg_contract())
-                .arg(arg_fuel())
-        )
-        .subcommand(
-            Command::new("revoke")
-                .about("Revoke delegation, without defining a new delegate.")
-        )
-}
-
-// ------------------------------------------------------------- arguments ----
-
-fn arg_validator() -> Arg {
-    Arg::new("validator")
-        .long("validator")
-        .short('v')
-        .value_name("STRING::HEX")
-        .help("The compiled validator code, hex-encoded. (e.g jq -r 'validators[0].compiledCode' plutus.json)")
-        .action(ArgAction::Set)
-}
-
-fn arg_contract() -> Arg {
-    Arg::new("contract")
-        .long("contract")
-        .short('c')
-        .value_name("TX_ID#IX")
-        .help("The UTxO holding the contract's state.")
-        .action(ArgAction::Set)
-}
-
-fn arg_fuel() -> Arg {
-    Arg::new("fuel")
-        .long("fuel")
-        .short('f')
-        .required(true)
-        .value_name("TX_ID#IX")
-        .help("A UTxO to use as fuel for the transaction.")
-        .action(ArgAction::Set)
-}
-
-fn arg_delegate() -> Arg {
-    Arg::new("delegate")
-        .long("delegate")
-        .short('s')
-        .value_name("STRING::HEX")
-        .help("Verification key hash digest (blake2b-228) of a delegate signatory. Use multiple times for multiple delegates.")
-        .action(ArgAction::Append)
-}
-
-fn arg_administrator() -> Arg {
-    Arg::new("administrator")
-        .long("administrator")
-        .short('a')
-        .value_name("STRING::HEX")
-        .help("Verification key hash digest (blake2b-228) of an administrator signatory. Use multiple times for multiple administrators.")
-        .action(ArgAction::Append)
-}
-
-fn arg_quorum() -> Arg {
-    Arg::new("quorum")
-        .long("quorum")
-        .short('q')
-        .value_name("UINT")
-        .help("Minimum number of delegates to authorize votes. Default to the total number of delegates (plenum).")
-        .action(ArgAction::Set)
-}
-
 // ---------------------------------------------------------------- helpers ----
+
+fn default_transaction_body() -> TransactionBody {
+    TransactionBody {
+        auxiliary_data_hash: None,
+        certificates: None,
+        collateral: None,
+        collateral_return: None,
+        donation: None,
+        fee: 0,
+        inputs: Set::from(vec![]),
+        mint: None,
+        network_id: None,
+        outputs: vec![],
+        proposal_procedures: None,
+        reference_inputs: None,
+        required_signers: None,
+        script_data_hash: None,
+        total_collateral: None,
+        treasury_value: None,
+        ttl: None,
+        validity_interval_start: None,
+        voting_procedures: None,
+        withdrawals: None,
+    }
+}
+
+fn default_witness_set() -> WitnessSet {
+    WitnessSet {
+        bootstrap_witness: None,
+        native_script: None,
+        plutus_data: None,
+        plutus_v1_script: None,
+        plutus_v2_script: None,
+        plutus_v3_script: None,
+        redeemer: None,
+        vkeywitness: None,
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 fn new_transaction_body(
     network_id: Network,
     inputs: Vec<TransactionInput>,
+    reference_inputs: Vec<TransactionInput>,
     outputs: Vec<PostAlonzoTransactionOutput>,
-    mint: Multiasset<NonZeroInt>,
+    mint: Option<Multiasset<NonZeroInt>>,
     certificates: Vec<Certificate>,
+    votes: Vec<(Voter, NonEmptyKeyValuePairs<GovActionId, VotingProcedure>)>,
     (collateral, collateral_return, total_collateral): (
         Vec<TransactionInput>,
         PostAlonzoTransactionOutput,
@@ -634,15 +1005,28 @@ fn new_transaction_body(
 ) -> TransactionBody {
     TransactionBody {
         inputs: Set::from(inputs),
-        reference_inputs: None,
+        reference_inputs: if reference_inputs.is_empty() {
+            None
+        } else {
+            Some(NonEmptySet::try_from(reference_inputs).unwrap())
+        },
         outputs: outputs
             .into_iter()
             .map(PseudoTransactionOutput::PostAlonzo)
             .collect(),
         fee,
         required_signers: NonEmptySet::try_from(extra_signatories).ok(),
-        mint: Some(mint),
-        certificates: Some(NonEmptySet::try_from(certificates).unwrap()),
+        mint,
+        certificates: if certificates.is_empty() {
+            None
+        } else {
+            Some(NonEmptySet::try_from(certificates).unwrap())
+        },
+        voting_procedures: if votes.is_empty() {
+            None
+        } else {
+            Some(NonEmptyKeyValuePairs::try_from(votes).unwrap())
+        },
         collateral: Some(NonEmptySet::try_from(collateral).unwrap()),
         collateral_return: Some(PseudoTransactionOutput::PostAlonzo(collateral_return)),
         total_collateral: Some(total_collateral),
@@ -651,15 +1035,7 @@ fn new_transaction_body(
             _ => NetworkId::One,
         }),
         script_data_hash: Some(script_data_hash),
-        // --------------------------------------
-        ttl: None,
-        validity_interval_start: None,
-        withdrawals: None,
-        auxiliary_data_hash: None,
-        voting_procedures: None,
-        proposal_procedures: None,
-        treasury_value: None,
-        donation: None,
+        ..default_transaction_body()
     }
 }
 
@@ -668,14 +1044,9 @@ fn new_witness_set(
     validator: Bytes,
 ) -> WitnessSet {
     WitnessSet {
-        vkeywitness: None,
-        native_script: None,
-        bootstrap_witness: None,
-        plutus_v1_script: None,
-        plutus_data: None,
         redeemer: Some(redeemers.into()),
-        plutus_v2_script: None,
         plutus_v3_script: Some(NonEmptySet::try_from(vec![PlutusV3Script(validator)]).unwrap()),
+        ..default_witness_set()
     }
 }
 
@@ -685,6 +1056,16 @@ fn void() -> PlutusData {
         any_constructor: None,
         fields: vec![],
     })
+}
+
+fn find_contract_token(value: &Value) -> Option<AssetName> {
+    match value {
+        Value::Multiasset(_, ref assets) => assets
+            .first()
+            .and_then(|(_, assets)| assets.first().cloned()),
+        _ => None,
+    }
+    .map(|pair| pair.0)
 }
 
 fn build_rules(delegates: &[Hash<28>], quorum: usize) -> (PlutusData, AssetName) {
@@ -719,6 +1100,45 @@ fn build_rules(delegates: &[Hash<28>], quorum: usize) -> (PlutusData, AssetName)
 
     (rules, asset_name.into())
 }
+
+// To avoid re-asking users for the delegates and quorum during vote (which is (1) inconvenient,
+// and (2), utterly confusing with the existing delegates signatories...), we pull the rules from
+// the minting transaction corresponding to the current state token. The token is always minted
+// alongside a DRep registration certificate which defines the new rules as redeemer.
+async fn recover_rules(
+    network: &Cardano,
+    validator_hash: &Hash<28>,
+    contract_value: &Value,
+) -> (PlutusData, AssetName) {
+    let asset_name = find_contract_token(contract_value).expect("no state token in contract utxo?");
+
+    let minting_txs = network.minting(validator_hash, &asset_name).await;
+
+    let minting_tx = minting_txs.first().unwrap_or_else(|| {
+        panic!(
+            "no minting transaction found for {}",
+            hex::encode(&asset_name[..]),
+        )
+    });
+
+    let rules = if let Some(ref redeemers) = minting_tx.transaction_witness_set.redeemer {
+        redeemers
+            .iter()
+            .find_map(|(key, value)| {
+                if key.tag == RedeemerTag::Cert && value.data != void() {
+                    Some(value.data.clone())
+                } else {
+                    None
+                }
+            })
+            .expect("could not find registration certificate alongside minting transaction?!")
+    } else {
+        unreachable!()
+    };
+
+    (rules, asset_name)
+}
+
 fn singleton_assets<T: Clone>(
     validator_hash: Hash<28>,
     assets: &[(AssetName, T)],
