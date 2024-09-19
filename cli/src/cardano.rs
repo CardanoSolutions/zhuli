@@ -1,3 +1,4 @@
+use crate::pallas_extra::BuildParams;
 use blockfrost::{BlockfrostAPI, Pagination};
 use blockfrost_openapi::models::{
     asset_history_inner::Action, tx_content_output_amount_inner::TxContentOutputAmountInner,
@@ -5,9 +6,11 @@ use blockfrost_openapi::models::{
 use pallas_addresses::Network;
 use pallas_codec::{minicbor as cbor, utils::NonEmptyKeyValuePairs};
 use pallas_primitives::conway::{
-    AssetName, PolicyId, PostAlonzoTransactionOutput, TransactionInput, Tx, Value,
+    AssetName, PolicyId, PostAlonzoTransactionOutput, TransactionInput, TransactionOutput, Tx,
+    Value,
 };
 use std::{collections::BTreeMap, env};
+use uplc::tx::ResolvedInput;
 
 pub struct Cardano {
     api: BlockfrostAPI,
@@ -35,6 +38,17 @@ pub struct ProtocolParameters {
     pub min_utxo_deposit_coefficient: u64,
     pub price_mem: f64,
     pub price_steps: f64,
+}
+
+impl From<&ProtocolParameters> for BuildParams {
+    fn from(params: &ProtocolParameters) -> BuildParams {
+        BuildParams {
+            fee_constant: params.fee_constant,
+            fee_coefficient: params.fee_coefficient,
+            price_mem: params.price_mem,
+            price_steps: params.price_steps,
+        }
+    }
 }
 
 impl Cardano {
@@ -175,7 +189,17 @@ impl Cardano {
         }
     }
 
-    pub async fn resolve(&self, input: &TransactionInput) -> Option<PostAlonzoTransactionOutput> {
+    pub async fn resolve_many(&self, inputs: &[&TransactionInput]) -> Vec<ResolvedInput> {
+        let mut resolved = vec![];
+        for i in inputs {
+            if let Some(r) = self.resolve(i).await {
+                resolved.push(r)
+            }
+        }
+        resolved
+    }
+
+    pub async fn resolve(&self, input: &TransactionInput) -> Option<ResolvedInput> {
         let utxo = self
             .api
             .transactions_utxos(hex::encode(input.transaction_id).as_str())
@@ -202,11 +226,14 @@ impl Cardano {
                     "non-null datum hash about to be ignored"
                 );
 
-                PostAlonzoTransactionOutput {
-                    address: from_bech32(&o.address).into(),
-                    value: from_tx_content_output_amounts(&o.amount[..]),
-                    datum_option: None,
-                    script_ref: None,
+                ResolvedInput {
+                    input: input.clone(),
+                    output: TransactionOutput::PostAlonzo(PostAlonzoTransactionOutput {
+                        address: from_bech32(&o.address).into(),
+                        value: from_tx_content_output_amounts(&o.amount[..]),
+                        datum_option: None,
+                        script_ref: None,
+                    }),
                 }
             })
     }

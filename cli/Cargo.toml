@@ -1,13 +1,13 @@
 [package]
-name = "cli"
-version = "0.1.0"
+name = "zhuli"
+version = "1.0.0"
 edition = "2021"
 
 [dependencies]
 bech32 = "0.11.0"
 blockfrost = "1.0.1"
 blockfrost-openapi = "0.0.3"
-clap = "4.5.17"
+clap = { version = "4.5.17", features = ["cargo"] }
 color-print = "0.3.6"
 hex = "0.4.3"
 indoc = "2.0.5"

@@ -1,6 +1,3 @@
-use std::{cmp::Ordering, str::FromStr};
-use uplc::tx::{eval_phase_two, ResolvedInput, SlotConfig};
-
 use pallas_addresses::{Network, ShelleyAddress, ShelleyDelegationPart, ShelleyPaymentPart};
 use pallas_codec::{
     minicbor as cbor,
@@ -9,9 +6,19 @@ use pallas_codec::{
 use pallas_crypto::hash::{Hash, Hasher};
 use pallas_primitives::conway::{
     AssetName, Constr, ExUnits, Language, Multiasset, NetworkId, PlutusData,
-    PostAlonzoTransactionOutput, PseudoTransactionOutput, RedeemersKey, RedeemersValue,
-    TransactionBody, TransactionInput, TransactionOutput, Tx, Value, WitnessSet,
+    PostAlonzoTransactionOutput, PseudoTransactionOutput, RedeemerTag, RedeemersKey,
+    RedeemersValue, TransactionBody, TransactionInput, TransactionOutput, Tx, Value, WitnessSet,
 };
+use std::{cmp::Ordering, str::FromStr};
+use uplc::tx::{eval_phase_two, ResolvedInput, SlotConfig};
+
+#[derive(Debug)]
+pub struct BuildParams {
+    pub fee_constant: u64,
+    pub fee_coefficient: u64,
+    pub price_mem: f64,
+    pub price_steps: f64,
+}
 
 pub struct OutputReference(pub TransactionInput);
 
@@ -33,6 +40,63 @@ impl FromStr for OutputReference {
             }
             _ => Err("malformed output reference: expected a hex-encode string and an index separated by '#'".to_string()),
         }
+    }
+}
+
+pub struct Redeemer {}
+
+impl Redeemer {
+    pub fn mint(index: u32, data: PlutusData, ex_units: ExUnits) -> (RedeemersKey, RedeemersValue) {
+        (
+            RedeemersKey {
+                tag: RedeemerTag::Mint,
+                index,
+            },
+            RedeemersValue { data, ex_units },
+        )
+    }
+
+    pub fn spend(
+        (inputs, target): (&[TransactionInput], &TransactionInput),
+        data: PlutusData,
+        ex_units: ExUnits,
+    ) -> (RedeemersKey, RedeemersValue) {
+        (
+            RedeemersKey {
+                tag: RedeemerTag::Spend,
+                index: inputs
+                    .iter()
+                    .enumerate()
+                    .find(|(_, i)| *i == target)
+                    .unwrap()
+                    .0 as u32,
+            },
+            RedeemersValue { data, ex_units },
+        )
+    }
+
+    pub fn publish(
+        index: u32,
+        data: PlutusData,
+        ex_units: ExUnits,
+    ) -> (RedeemersKey, RedeemersValue) {
+        (
+            RedeemersKey {
+                tag: RedeemerTag::Cert,
+                index,
+            },
+            RedeemersValue { data, ex_units },
+        )
+    }
+
+    pub fn vote(index: u32, data: PlutusData, ex_units: ExUnits) -> (RedeemersKey, RedeemersValue) {
+        (
+            RedeemersKey {
+                tag: RedeemerTag::Vote,
+                index,
+            },
+            RedeemersValue { data, ex_units },
+        )
     }
 }
 
@@ -102,13 +166,20 @@ pub fn from_validator(validator: &[u8], network_id: Network) -> (Hash<28>, Shell
     (validator_hash, validator_address)
 }
 
-pub fn subtract(total_value: Value, total_cost: u64) -> Option<Value> {
-    match total_value {
-        Value::Coin(total) if total > total_cost => Some(Value::Coin(total - total_cost)),
-        Value::Multiasset(total, assets) if total > total_cost => {
-            Some(Value::Multiasset(total - total_cost, assets))
+pub fn value_subtract_lovelace(value: Value, lovelace: u64) -> Option<Value> {
+    match value {
+        Value::Coin(total) if total > lovelace => Some(Value::Coin(total - lovelace)),
+        Value::Multiasset(total, assets) if total > lovelace => {
+            Some(Value::Multiasset(total - lovelace, assets))
         }
         _ => None,
+    }
+}
+
+pub fn value_add_lovelace(value: Value, lovelace: u64) -> Value {
+    match value {
+        Value::Coin(total) => Value::Coin(total + lovelace),
+        Value::Multiasset(total, assets) => Value::Multiasset(total + lovelace, assets),
     }
 }
 
@@ -132,10 +203,10 @@ where
     build((buffer.len() as u64 + 164) * per_byte)
 }
 
-pub fn total_execution_cost((price_mem, price_steps): (f64, f64), redeemers: &[ExUnits]) -> u64 {
+pub fn total_execution_cost(params: &BuildParams, redeemers: &[ExUnits]) -> u64 {
     redeemers.iter().fold(0, |acc, ex_units| {
-        acc + ((price_mem * ex_units.mem as f64).ceil() as u64)
-            + ((price_steps * ex_units.steps as f64).ceil() as u64)
+        acc + ((params.price_mem * ex_units.mem as f64).ceil() as u64)
+            + ((params.price_steps * ex_units.steps as f64).ceil() as u64)
     })
 }
 
@@ -219,11 +290,7 @@ pub fn default_witness_set() -> WitnessSet {
 // Build a transaction by repeatedly executing some building logic with different fee and execution
 // units settings. Stops when a fixed point is reached. The final transaction has corresponding
 // fees and execution units.
-pub fn build_transaction<F>(
-    (fee_constant, fee_coefficient, prices): (u64, u64, (f64, f64)),
-    resolved_inputs: &[ResolvedInput],
-    with: F,
-) -> Tx
+pub fn build_transaction<F>(params: &BuildParams, resolved_inputs: &[ResolvedInput], with: F) -> Tx
 where
     F: Fn(u64, &[ExUnits]) -> Tx,
 {
@@ -288,10 +355,10 @@ where
                     .map(|xs| xs.len())
                     .unwrap_or(0);
 
-            fee_constant
-                + fee_coefficient
+            params.fee_constant
+                + params.fee_coefficient
                     * (5 + ex_units.len() * 16 + num_signatories * 102 + serialized_tx.len()) as u64
-                + total_execution_cost(prices, &ex_units)
+                + total_execution_cost(params, &ex_units)
         };
 
         // Check if we've reached a fixed point, or start over.
@@ -311,4 +378,12 @@ where
     }
 
     tx
+}
+
+pub fn expect_post_alonzo(output: &TransactionOutput) -> &PostAlonzoTransactionOutput {
+    if let TransactionOutput::PostAlonzo(ref o) = output {
+        o
+    } else {
+        panic!("expected PostAlonzo output but got a legacy one.")
+    }
 }
