@@ -253,9 +253,11 @@ fn register(
           fn(o) { o.address.payment_credential == Script(validator_hash) },
         )
       when n_ours is {
-        0 -> [sc_no_required_initial_output, ..labels]
+        0 ->
+          [sc_no_required_initial_output, ..labels]
         1 -> labels
-        _ -> [sc_too_many_initial_outputs, ..labels]
+        _ ->
+          [sc_too_many_initial_outputs, ..labels]
       }
     } else {
       list.filter(
@@ -1103,7 +1105,8 @@ fn our_value_restricted_to(utxo: List<Input>, mask: List<PolicyId>) -> Value {
 /// Insert an element in a list at the given position.
 fn insert(self: List<a>, ix: Int, elem: a) -> List<a> {
   when self is {
-    [] -> [elem]
+    [] ->
+      [elem]
     [head, ..tail] ->
       if ix == 0 {
         [elem, head, ..tail]
