@@ -1,7 +1,12 @@
 [package]
 name = "zhuli"
-version = "1.0.0"
+description = "A companion command-line tool for managing a hot/cold DRep setup."
+version = "0.0.1"
 edition = "2021"
+repository = "https://github.com/CardanoSolutions/zhuli"
+homepage = "https://github.com/CardanoSolutions/zhuli"
+authors = ["KtorZ <matthias.benkort@gmail.com>"]
+license = "MPL-2.0"
 
 [dependencies]
 bech32 = "0.11.0"
