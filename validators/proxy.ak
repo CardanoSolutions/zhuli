@@ -43,7 +43,7 @@ validator direct_proxy {
             RegisterDelegateRepresentative {
               delegate_representative: credential,
               ..
-            } |
+            } | 
             UnregisterDelegateRepresentative {
               delegate_representative: credential,
               ..

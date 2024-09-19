@@ -255,22 +255,22 @@ fn publish_handlers(
     True,
     fn(ix, certificate, st) {
       when certificate is {
-        UnregisterCredential { credential, .. } |
-        DelegateCredential { credential, .. } |
-        RegisterAndDelegateCredential { credential, .. } |
+        UnregisterCredential { credential, .. } | 
+        DelegateCredential { credential, .. } | 
+        RegisterAndDelegateCredential { credential, .. } | 
         RegisterDelegateRepresentative {
           delegate_representative: credential,
           ..
-        } |
-        UpdateDelegateRepresentative { delegate_representative: credential } |
+        } | 
+        UpdateDelegateRepresentative { delegate_representative: credential } | 
         UnregisterDelegateRepresentative {
           delegate_representative: credential,
           ..
-        } |
+        } | 
         AuthorizeConstitutionalCommitteeProxy {
           constitutional_committee_member: credential,
           ..
-        } |
+        } | 
         RetireFromConstitutionalCommittee {
           constitutional_committee_member: credential,
         } ->
