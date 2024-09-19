@@ -19,6 +19,7 @@ A validator & companion comman-line tool to provide hot/cold account management 
 - [x] Revokation of a delegate as a single transaction.
 - [x] Revokation & redelegation possible as a single transaction.
 - [x] No datum, the state is fully captured in minted assets trapped in the validator.
+- [x] Simplified off-chain management and contract flow thanks to a [companion command-line tool](./cli)
 
 ### Todo
 
