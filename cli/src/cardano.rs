@@ -11,6 +11,7 @@ use std::{collections::BTreeMap, env};
 
 pub struct Cardano {
     api: BlockfrostAPI,
+    client: reqwest::Client,
     network: Network,
     network_prefix: String,
     project_id: String,
@@ -43,6 +44,7 @@ impl Cardano {
         let api = BlockfrostAPI::new(project_id.as_str(), Default::default());
         Cardano {
             api,
+            client: reqwest::Client::new(),
             network: if project_id.starts_with(MAINNET_PREFIX) {
                 Network::Mainnet
             } else {
@@ -140,34 +142,37 @@ impl Cardano {
             })
             .collect::<Vec<_>>();
 
-        let client = reqwest::Client::new();
-
         let mut txs: Vec<Tx> = vec![];
         for tx_hash in history {
-            // NOTE: Not part of the Rust SDK somehow...
-            let response = client
-                .get(&format!(
-                    "https://cardano-{}.blockfrost.io/api/v0/txs/{}/cbor",
-                    self.network_prefix, tx_hash
-                ))
-                .header("Accept", "application/json")
-                .header("project_id", self.project_id.as_str())
-                .send()
-                .await
-                .unwrap();
-            match response.status() {
-                reqwest::StatusCode::OK => {
-                    let TxByHash { cbor } = response.json::<TxByHash>().await.unwrap();
-                    let tx = cbor::decode(&hex::decode(cbor).unwrap()).unwrap();
-                    txs.push(tx);
-                }
-                status => {
-                    panic!("unexpected response status from Blockfrost: {}", status);
-                }
-            };
+            if let Some(tx) = self.transaction_by_hash(&tx_hash).await {
+                txs.push(tx)
+            }
         }
-
         txs
+    }
+
+    pub async fn transaction_by_hash(&self, tx_hash: &str) -> Option<Tx> {
+        // NOTE: Not part of the Rust SDK somehow...
+        let response = self
+            .client
+            .get(&format!(
+                "https://cardano-{}.blockfrost.io/api/v0/txs/{}/cbor",
+                self.network_prefix, tx_hash
+            ))
+            .header("Accept", "application/json")
+            .header("project_id", self.project_id.as_str())
+            .send()
+            .await
+            .unwrap();
+
+        match response.status() {
+            reqwest::StatusCode::OK => {
+                let TxByHash { cbor } = response.json::<TxByHash>().await.unwrap();
+                let tx = cbor::decode(&hex::decode(cbor).unwrap()).unwrap();
+                Some(tx)
+            }
+            _ => None,
+        }
     }
 
     pub async fn resolve(&self, input: &TransactionInput) -> Option<PostAlonzoTransactionOutput> {
