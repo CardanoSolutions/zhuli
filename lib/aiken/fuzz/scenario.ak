@@ -1,6 +1,6 @@
-//  This Source Code Form is subject to the terms of the Mozilla Public
-//  License, v. 2.0. If a copy of the MPL was not distributed with this
-//  file, You can obtain one at http://mozilla.org/MPL/2.0/.
+////  This Source Code Form is subject to the terms of the Mozilla Public
+////  License, v. 2.0. If a copy of the MPL was not distributed with this
+////  file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 use aiken/cbor.{serialise}
 use aiken/collection/dict
@@ -255,22 +255,22 @@ fn publish_handlers(
     True,
     fn(ix, certificate, st) {
       when certificate is {
-        UnregisterCredential { credential, .. } | 
-        DelegateCredential { credential, .. } | 
-        RegisterAndDelegateCredential { credential, .. } | 
+        UnregisterCredential { credential, .. } |
+        DelegateCredential { credential, .. } |
+        RegisterAndDelegateCredential { credential, .. } |
         RegisterDelegateRepresentative {
           delegate_representative: credential,
           ..
-        } | 
-        UpdateDelegateRepresentative { delegate_representative: credential } | 
+        } |
+        UpdateDelegateRepresentative { delegate_representative: credential } |
         UnregisterDelegateRepresentative {
           delegate_representative: credential,
           ..
-        } | 
+        } |
         AuthorizeConstitutionalCommitteeProxy {
           constitutional_committee_member: credential,
           ..
-        } | 
+        } |
         RetireFromConstitutionalCommittee {
           constitutional_committee_member: credential,
         } ->

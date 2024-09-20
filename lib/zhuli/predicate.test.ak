@@ -6,9 +6,9 @@ use aiken/crypto.{ScriptHash}
 use aiken/fuzz.{both}
 use cardano/address.{Address}
 use cardano/assets.{ada_policy_id}
-use cardano/credential/proxy.{must_forward_strict_assets}
 use cardano/generator.{any_ada_only_value, any_value_with}
 use sundae/multisig.{MultisigScript}
+use zhuli/predicate.{must_forward_strict_assets}
 
 // NOTE: Needs not to be an actual policy id, as we never re-hash anything. So
 // we might as well make it something we can easily recognize.

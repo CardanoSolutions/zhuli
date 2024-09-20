@@ -1,9 +1,10 @@
-//  This Source Code Form is subject to the terms of the Mozilla Public
-//  License, v. 2.0. If a copy of the MPL was not distributed with this
-//  file, You can obtain one at http://mozilla.org/MPL/2.0/.
+////  This Source Code Form is subject to the terms of the Mozilla Public
+////  License, v. 2.0. If a copy of the MPL was not distributed with this
+////  file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 use aiken/collection/dict
 use aiken/collection/list.{for_each}
+use aiken/collection/list/extra.{insert}
 use aiken/collection/pairs
 use aiken/crypto.{ScriptHash, VerificationKeyHash}
 use aiken/fuzz.{
@@ -19,9 +20,6 @@ use cardano/assets.{
 use cardano/certificate.{
   Certificate, RegisterDelegateRepresentative, UnregisterDelegateRepresentative,
 }
-use cardano/credential/proxy/state.{
-  BlockProduction, Governance, into_asset_name, match_prefix, prefix,
-}
 use cardano/generator.{
   any_address, any_asset_name, any_policy_id, any_value_extending,
   any_zero_output,
@@ -31,8 +29,11 @@ use cardano/transaction.{
 }
 use cardano/transaction/script_purpose
 use config
-use proxy as handlers
 use sundae/multisig.{MultisigScript}
+use zhuli as handlers
+use zhuli/state.{
+  BlockProduction, Governance, into_asset_name, match_prefix, prefix,
+}
 
 const validator_hash: ScriptHash = #"0123456789abcedf"
 
@@ -124,30 +125,28 @@ test prop_scenario_coverage(
   label_when(outcome == scenario.Ok, @"O.K.", @"K.O.")
 }
 
-test prop_proxy_drep_ok(ok via scenario.ok(default_state, step)) {
+test prop_zhuli_ok(ok via scenario.ok(default_state, step)) {
   scenario.run(
     ok,
     validator_hash,
-    handlers.direct_proxy.mint,
-    handlers.direct_proxy.spend,
-    handlers.direct_proxy.withdraw,
-    handlers.direct_proxy.publish,
-    cast_redeemer(handlers.direct_proxy.vote),
+    handlers.zhuli.mint,
+    handlers.zhuli.spend,
+    handlers.zhuli.withdraw,
+    handlers.zhuli.publish,
+    cast_redeemer(handlers.zhuli.vote),
   )
 }
 
-test prop_proxy_drep_ko(
-  (labels, scenario) via scenario.ko(default_state, step),
-) fail {
+test prop_zhuli_ko((labels, scenario) via scenario.ko(default_state, step)) fail {
   for_each(list.unique(labels), fuzz.label)
   scenario.run(
     scenario,
     validator_hash,
-    handlers.direct_proxy.mint,
-    handlers.direct_proxy.spend,
-    handlers.direct_proxy.withdraw,
-    handlers.direct_proxy.publish,
-    cast_redeemer(handlers.direct_proxy.vote),
+    handlers.zhuli.mint,
+    handlers.zhuli.spend,
+    handlers.zhuli.withdraw,
+    handlers.zhuli.publish,
+    cast_redeemer(handlers.zhuli.vote),
   )
 }
 
@@ -1100,18 +1099,4 @@ fn our_value_restricted_to(utxo: List<Input>, mask: List<PolicyId>) -> Value {
       }
     },
   )
-}
-
-/// Insert an element in a list at the given position.
-fn insert(self: List<a>, ix: Int, elem: a) -> List<a> {
-  when self is {
-    [] ->
-      [elem]
-    [head, ..tail] ->
-      if ix == 0 {
-        [elem, head, ..tail]
-      } else {
-        [head, ..insert(tail, ix - 1, elem)]
-      }
-  }
 }

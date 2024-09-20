@@ -1,6 +1,6 @@
-//  This Source Code Form is subject to the terms of the Mozilla Public
-//  License, v. 2.0. If a copy of the MPL was not distributed with this
-//  file, You can obtain one at http://mozilla.org/MPL/2.0/.
+////  This Source Code Form is subject to the terms of the Mozilla Public
+////  License, v. 2.0. If a copy of the MPL was not distributed with this
+////  file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 use aiken/collection/dict
 use aiken/collection/list
@@ -10,15 +10,15 @@ use cardano/certificate.{
   Certificate, RegisterDelegateRepresentative, UnregisterDelegateRepresentative,
   UpdateDelegateRepresentative,
 }
-use cardano/credential/proxy.{
-  must_be_approved_by_administrator, must_be_approved_by_delegate,
-  must_forward_script, update_delegate,
-}
-use cardano/credential/proxy/state.{Governance}
 use cardano/governance.{DelegateRepresentative, Voter}
 use cardano/transaction.{Input, OutputReference, Transaction}
 use config
 use sundae/multisig.{MultisigScript}
+use zhuli/predicate.{
+  Register, Unregister, must_be_approved_by_administrator,
+  must_be_approved_by_delegate, must_forward_script, update_delegate,
+}
+use zhuli/state.{Governance}
 
 const administrator: MultisigScript =
   multisig.AtLeast {
@@ -26,7 +26,7 @@ const administrator: MultisigScript =
     scripts: list.map(config.administrators, multisig.Signature),
   }
 
-validator direct_proxy {
+validator zhuli {
   // The minting and burning of tokens is mostly delegated and tied to the registration/unregistration of
   // the delegate script credential. The ledger enforces that one can only register a DRep once, which gives
   // us the uniqueness property necessary to issue an NFT.
@@ -43,7 +43,7 @@ validator direct_proxy {
             RegisterDelegateRepresentative {
               delegate_representative: credential,
               ..
-            } | 
+            } |
             UnregisterDelegateRepresentative {
               delegate_representative: credential,
               ..
@@ -110,13 +110,13 @@ validator direct_proxy {
       RegisterDelegateRepresentative { delegate_representative: delegate, .. } ->
         and {
           must_be_approved_by_administrator(self, administrator)?,
-          update_delegate(self, rules, delegate, Governance, proxy.Register)?,
+          update_delegate(self, rules, delegate, Governance, Register)?,
         }
 
       UnregisterDelegateRepresentative { delegate_representative: delegate, .. } ->
         and {
           must_be_approved_by_administrator(self, administrator)?,
-          update_delegate(self, rules, delegate, Governance, proxy.Unregister)?,
+          update_delegate(self, rules, delegate, Governance, Unregister)?,
         }
 
       // The UpdateDelegateRepresentative certificate is only used to update

@@ -10,9 +10,9 @@ use cardano/assets.{Lovelace, PolicyId, Value, ada_policy_id}
 use cardano/certificate.{
   RegisterDelegateRepresentative, UnregisterDelegateRepresentative,
 }
-use cardano/credential/proxy/state.{DelegateKind}
 use cardano/transaction.{Input, NoDatum, Output, Transaction}
 use sundae/multisig.{MultisigScript}
+use zhuli/state.{DelegateKind}
 
 pub type Update {
   Register
