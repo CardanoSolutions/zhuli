@@ -8,8 +8,8 @@ use aiken/collection/list/extra.{insert}
 use aiken/collection/pairs
 use aiken/crypto.{ScriptHash, VerificationKeyHash}
 use aiken/fuzz.{
-  and_then, bytearray_between, constant, int_at_least, int_between, label_when,
-  list_between, map,
+  and_then, bytearray_between, constant, int_at_least, int_between, label,
+  label_when, list_between, map,
 }
 use aiken/fuzz/scenario.{Done, Label, Scenario}
 use aiken/primitive/bytearray
@@ -135,6 +135,7 @@ test prop_zhuli_ok(ok via scenario.ok(default_state, step)) {
     handlers.zhuli.publish,
     cast_redeemer(handlers.zhuli.vote),
   )
+  post_conditions(ok)
 }
 
 test prop_zhuli_ko((labels, scenario) via scenario.ko(default_state, step)) fail {
@@ -151,6 +152,93 @@ test prop_zhuli_ko((labels, scenario) via scenario.ko(default_state, step)) fail
 }
 
 // ------------------------------------------------------------- post-conditions
+
+// Analyze valid scenarios and ensure that they meet certain criteria. Also
+// take the opportunity to label scenarios accordingly.
+fn post_conditions(steps: List<Transaction>) {
+  // Analyze registrations
+  let (is_register, is_reregister, is_unregister, is_forward) =
+    list.foldl(
+      steps,
+      (False, False, False, False),
+      fn(step, (is_reg, is_rereg, is_unreg, is_forward)) {
+        let (reg, unreg) =
+          list.foldr(
+            step.certificates,
+            (False, False),
+            fn(cert, (reg, unreg)) {
+              when cert is {
+                RegisterDelegateRepresentative(..) -> (True, unreg)
+                UnregisterDelegateRepresentative(..) -> (reg, True)
+                _ -> (reg, unreg)
+              }
+            },
+          )
+
+        let is_reg = is_reg || reg && !unreg
+        let is_rereg = is_rereg || reg && unreg
+        let is_unreg = is_unreg || unreg && !reg
+        let is_forward = is_forward || !reg && !unreg
+
+        expect !(is_unreg && !is_reg)
+        expect !(is_rereg && !is_reg)
+
+        (is_reg, is_rereg, is_unreg, is_forward)
+      },
+    )
+
+  @"contains solo registration" |> label_if(is_register)
+  @"contains re-registration" |> label_if(is_reregister)
+  @"contains solo unregistration" |> label_if(is_unregister)
+  @"contains forward-only" |> label_if(is_forward)
+
+  // Analyze minting
+  let minted =
+    list.foldr(
+      steps,
+      [],
+      fn(step, minted) {
+        assets.reduce(
+          step.mint,
+          minted,
+          fn(policy_id, asset_name, quantity, minted) {
+            if policy_id == validator_hash {
+              [(asset_name, quantity), ..minted]
+            } else {
+              minted
+            }
+          },
+        )
+      },
+    )
+
+  let total_minted =
+    list.foldr(
+      minted,
+      assets.zero,
+      fn((asset_name, quantity), total) {
+        assets.add(total, validator_hash, asset_name, quantity)
+      },
+    )
+
+  expect !(minted == [] && ( is_register || is_reregister || is_unregister ))
+
+  expect or {
+      total_minted == assets.zero,
+      {
+        expect [(_, _, 1)] = assets.flatten(total_minted)
+        True
+      },
+    }
+}
+
+fn label_if(str: String, predicate: Bool) {
+  if predicate {
+    label(str)
+  } else {
+    Void
+  }
+}
 
 // ------------------------------------------------------------------ generators
 
@@ -327,9 +415,12 @@ fn unregister(
       ),
     )
 
-  let total =
-    total_value(utxo)
-      |> assets.add(validator_hash, alice_st, -1)
+  // Compute the new output balance, minus the registration token.
+  // Note that we should only get into this generator step when
+  // there exists a token from alice minted during registration.
+  let total = total_value(utxo)
+  expect assets.quantity_of(total, validator_hash, alice_st) == 1
+  let total = assets.add(total, validator_hash, alice_st, -1)
 
   let (labels, certs, cert_redeemers) <-
     and_then(published_certificates(labels, mint))
@@ -375,7 +466,7 @@ fn unregister(
   let mint =
     list.foldr(
       outputs,
-      assets.add(mint, validator_hash, bob_st, -1),
+      assets.from_asset(validator_hash, alice_st, -1),
       fn(output, mint) {
         assets.merge(mint, assets.restricted_to(output.value, [validator_hash]))
       },
