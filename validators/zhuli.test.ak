@@ -340,11 +340,9 @@ fn register(
           fn(o) { o.address.payment_credential == Script(validator_hash) },
         )
       when n_ours is {
-        0 ->
-          [sc_no_required_initial_output, ..labels]
+        0 -> [sc_no_required_initial_output, ..labels]
         1 -> labels
-        _ ->
-          [sc_too_many_initial_outputs, ..labels]
+        _ -> [sc_too_many_initial_outputs, ..labels]
       }
     } else {
       list.filter(

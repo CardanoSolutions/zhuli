@@ -5,8 +5,7 @@
 /// Insert an element in a list at the given position.
 pub fn insert(self: List<a>, ix: Int, elem: a) -> List<a> {
   when self is {
-    [] ->
-      [elem]
+    [] -> [elem]
     [head, ..tail] ->
       if ix == 0 {
         [elem, head, ..tail]
