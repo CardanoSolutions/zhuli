@@ -289,20 +289,23 @@ fn register(
     our_value_restricted_to(utxo, [ada_policy_id, validator_hash])
 
   // The administrator does authorize (un)registration, and thus, it is totally
-  // allowed to NOT forward all lovelaces to the resulting address. This fork
-  // checks that.
-  let our_assets <-
+  // allowed to NOT forward all lovelaces to the resulting address, so long as
+  // it's signed by the administrator. This fork checks that.
+  let (labels, our_assets) <-
     and_then(
       scenario.fork(
         240,
-        fn() { constant(our_assets) },
+        fn() { constant((labels, our_assets)) },
         fn() {
           let lovelace = assets.lovelace_of(our_assets)
           if lovelace > 1 {
             let removed <- map(int_between(1, lovelace - 1))
-            assets.add(our_assets, ada_policy_id, ada_asset_name, -removed)
+            (
+              [sc_insufficient_lovelace_forwarded, ..labels],
+              assets.add(our_assets, ada_policy_id, ada_asset_name, -removed),
+            )
           } else {
-            constant(our_assets)
+            constant((labels, our_assets))
           }
         },
       ),
