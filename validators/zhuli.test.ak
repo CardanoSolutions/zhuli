@@ -8,7 +8,7 @@ use aiken/collection/list/extra.{insert}
 use aiken/collection/pairs
 use aiken/crypto.{ScriptHash, VerificationKeyHash}
 use aiken/fuzz.{
-  and_then, bytearray_between, constant, int_at_least, int_between, label,
+  and_then, bytearray_between, constant, int_at_least, int_between, label_if,
   label_when, list_between, map,
 }
 use aiken/fuzz/scenario.{Done, Label, Scenario}
@@ -72,41 +72,39 @@ const default_state =
 
 // ------------------------------------------------------------------- scenarios
 
-const sc_missing_admin_approval_for_foreign_assets: String =
-  @"Missing administrator approval for foreign assets"
+const sc_missing_admin_approval_for_transfer: String =
+  @"x missing administrator approval for transfer"
 
 const sc_missing_admin_approval_for_register: String =
-  @"Missing administrator approval for registration"
+  @"x missing administrator approval for registration"
 
 const sc_missing_admin_approval_for_unregister: String =
-  @"Missing administrator approval for unregistration"
-
-const sc_insufficient_lovelace_forwarded: String =
-  @"Insufficient lovelace quantity forwarded"
+  @"x missing administrator approval for unregistration"
 
 const sc_lock_without_delegation: String =
-  @"Locked without delegation credentials"
+  @"x locked without delegation credentials"
 
 const sc_initialize_illegal_quantity: String =
-  @"Initialized state token with illegal quantity"
+  @"x initialized state token with illegal quantity"
 
 const sc_initialize_illegal_asset_name: String =
-  @"Initialized state token with illegal asset name"
+  @"x initialized state token with illegal asset name"
 
-const sc_no_required_initial_output: String = @"No initial output when required"
+const sc_no_required_initial_output: String =
+  @"x no initial output when required"
 
-const sc_too_many_initial_outputs: String = @"Too many initial outputs"
+const sc_too_many_initial_outputs: String = @"x too many initial outputs"
 
-const sc_untrapped_minted_tokens: String = @"Untrapped state tokens"
+const sc_untrapped_minted_tokens: String = @"x untrapped state tokens"
 
-const sc_escaping_state_tokens: String = @"Escaping state tokens"
+const sc_escaping_state_tokens: String = @"x escaping state tokens"
 
-const sc_forwarded_noise: String = @"Forwarded noise assets"
+const sc_forwarded_noise: String = @"x forwarded noise assets"
 
-const sc_too_many_forwarding_outputs: String = @"Too many forwarding outputs"
+const sc_too_many_forwarding_outputs: String = @"x too many forwarding outputs"
 
 const sc_missing_certificate_with_mint: String =
-  @"Missing certificates during mint/burn"
+  @"x missing certificates during mint/burn"
 
 // ------------------------------------------------------------------ properties
 
@@ -187,10 +185,10 @@ fn post_conditions(steps: List<Transaction>) {
       },
     )
 
-  @"contains solo registration" |> label_if(is_register)
-  @"contains re-registration" |> label_if(is_reregister)
-  @"contains solo unregistration" |> label_if(is_unregister)
-  @"contains forward-only" |> label_if(is_forward)
+  @"✓ solo registration" |> label_if(is_register)
+  @"✓ re-registration" |> label_if(is_reregister)
+  @"✓ solo unregistration" |> label_if(is_unregister)
+  @"✓ forward-only" |> label_if(is_forward)
 
   // Analyze minting
   let minted =
@@ -232,14 +230,6 @@ fn post_conditions(steps: List<Transaction>) {
     }
 }
 
-fn label_if(str: String, predicate: Bool) {
-  if predicate {
-    label(str)
-  } else {
-    Void
-  }
-}
-
 // ------------------------------------------------------------------ generators
 
 // TODO: Voting
@@ -260,7 +250,7 @@ fn step(st: State, utxo: List<Input>) -> Fuzzer<Scenario<State>> {
       scenario.fork(
         if st.registered && !st.unregistered {
           // Attempts to unregister
-          208
+          160
         } else {
           // Only forward
           0
@@ -301,7 +291,7 @@ fn register(
           if lovelace > 1 {
             let removed <- map(int_between(1, lovelace - 1))
             (
-              [sc_insufficient_lovelace_forwarded, ..labels],
+              labels,
               assets.add(our_assets, ada_policy_id, ada_asset_name, -removed),
             )
           } else {
@@ -359,24 +349,29 @@ fn register(
       )
     }
 
-  let labels =
-    if utxo_holds_foreign_assets(utxo) {
-      [sc_missing_admin_approval_for_foreign_assets, ..labels]
-    } else {
-      labels
-    }
-
   let st = State { ..st, registered: is_minting }
 
   if list.is_empty(certs) {
-    constant(Scenario(labels, st, tx))
+    finalize_with_signature(
+      245,
+      labels,
+      st,
+      tx,
+      fn(labels) {
+        if our_assets == assets.zero {
+          labels
+        } else {
+          [sc_missing_admin_approval_for_transfer, ..labels]
+        }
+      },
+    )
   } else {
     finalize_with_signature(
       240,
       labels,
       st,
       tx,
-      sc_missing_admin_approval_for_register,
+      fn(labels) { [sc_missing_admin_approval_for_register, ..labels] },
     )
   }
 }
@@ -392,7 +387,7 @@ fn unregister(
   let (mint, mint_redeemers) <-
     and_then(
       scenario.fork(
-        208,
+        128,
         // Replace a delegate with another.
         fn() {
           constant(
@@ -492,7 +487,7 @@ fn unregister(
     labels,
     State { ..st, unregistered: True },
     tx,
-    sc_missing_admin_approval_for_unregister,
+    fn(labels) { [sc_missing_admin_approval_for_unregister, ..labels] },
   )
 }
 
@@ -524,15 +519,12 @@ fn forward_assets(
 
   let all_lovelace = total_lovelace(utxo)
 
-  let (labels, outputs, forwarded_lovelace) <-
+  let (labels, outputs) <-
     and_then(
       scenario.fork(
-        240,
+        220,
         fn() {
-          // Most of the time, forward all input lovelaces. Sometimes, forward less. Note that
-          // this isn't an immediate K.O. scenario because it depends whether the transaction is
-          // authorized by the administrators or not. So the label is applied down below, depending
-          // on this fact.
+          // Most of the time, forward all input lovelaces. Sometimes, forward less.
           let forwarded_lovelace <-
             and_then(
               scenario.fork(
@@ -663,16 +655,16 @@ fn forward_assets(
               },
             )
 
-          constant((labels, outputs, forwarded_lovelace))
+          constant((labels, outputs))
         },
         fn() {
           // Otherwise, distribute all assets at random which should
           // be caught and rejected by the spend validator.
           let outputs <- map(any_split(all_value))
           if assets.tokens(all_value, validator_hash) != dict.empty {
-            ([sc_escaping_state_tokens, ..labels], outputs, 0)
+            ([sc_escaping_state_tokens, ..labels], outputs)
           } else {
-            (labels, outputs, 0)
+            (labels, outputs)
           }
         },
       ),
@@ -690,34 +682,19 @@ fn forward_assets(
       redeemers: spend_redeemers,
     }
 
-  // NOTE: A signature from the administrator might be needed in two cases:
-  //
-  // - We are trying to spend assets that do long belong to the validator
-  // - We are trying to re-allocate some lovelace quantity
-  //
-  // So we do sign conditionally, but we distinguish the two failing scenarios
-  // to generate better errors/reporting.
-  if utxo_holds_foreign_assets(our_utxo) {
-    finalize_with_signature(
-      128,
-      labels,
-      st,
-      tx,
-      sc_missing_admin_approval_for_foreign_assets,
-    )
-  } else if our_lovelace > 0 && forwarded_lovelace < our_lovelace {
-    finalize_with_signature(
-      220,
-      labels,
-      st,
-      tx,
-      sc_insufficient_lovelace_forwarded,
-    )
-  } else {
-    // NOTE: This else branch is *not necessarily* O.K. as it depends on
-    // the way we constructed the output which is captured within the 'labels'
-    constant(Scenario(labels, st, tx))
-  }
+  finalize_with_signature(
+    220,
+    labels,
+    st,
+    tx,
+    fn(labels) {
+      if our_utxo == [] {
+        labels
+      } else {
+        [sc_missing_admin_approval_for_transfer, ..labels]
+      }
+    },
+  )
 }
 
 /// Generate a random distribution of outputs given a total value.
@@ -750,13 +727,7 @@ fn any_initial_outputs(
       (labels, [output])
     },
     // Generate 0 initial outputs
-    fn() {
-      if assets.lovelace_of(in) > 0 {
-        constant(([sc_insufficient_lovelace_forwarded, ..labels], []))
-      } else {
-        constant((labels, []))
-      }
-    },
+    fn() { constant((labels, [])) },
     fn() {
       // Generate many (>= 2) initial outputs.
       let (fst_labels, fst_output) <-
@@ -942,7 +913,7 @@ fn finalize_with_signature(
   labels: List<Label>,
   st: State,
   tx: Transaction,
-  on_missing_signature: String,
+  on_missing_signature: fn(List<String>) -> List<String>,
 ) -> Fuzzer<Scenario<State>> {
   scenario.fork(
     pivot,
@@ -952,8 +923,7 @@ fn finalize_with_signature(
           labels,
           fn(lbl) {
             and {
-              lbl != sc_insufficient_lovelace_forwarded,
-              lbl != sc_missing_admin_approval_for_foreign_assets,
+              lbl != sc_missing_admin_approval_for_transfer,
               lbl != sc_missing_admin_approval_for_register,
               lbl != sc_missing_admin_approval_for_unregister,
             }
@@ -967,7 +937,7 @@ fn finalize_with_signature(
         ),
       )
     },
-    fn() { constant(Scenario([on_missing_signature, ..labels], st, tx)) },
+    fn() { constant(Scenario(on_missing_signature(labels), st, tx)) },
   )
 }
 
@@ -1128,18 +1098,6 @@ fn published_certificates(
 }
 
 // --------------------------------------------------------------------- helpers
-
-fn utxo_holds_foreign_assets(utxo: List<Input>) -> Bool {
-  list.any(
-    utxo,
-    fn(input) {
-      and {
-        input.output.address.payment_credential == Script(validator_hash),
-        value_holds_foreign_assets(input.output.value),
-      }
-    },
-  )
-}
 
 fn value_holds_foreign_assets(value: Value) -> Bool {
   list.any(

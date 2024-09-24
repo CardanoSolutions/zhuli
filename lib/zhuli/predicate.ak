@@ -6,7 +6,7 @@ use aiken/collection/dict
 use aiken/collection/list
 use aiken/crypto.{ScriptHash}
 use cardano/address.{Address, Credential, Inline, Script}
-use cardano/assets.{Lovelace, PolicyId, Value, ada_policy_id}
+use cardano/assets.{PolicyId, Value, ada_policy_id}
 use cardano/certificate.{
   RegisterDelegateRepresentative, UnregisterDelegateRepresentative,
 }
@@ -59,25 +59,19 @@ pub fn must_forward_script(
     }
 
   // Ensure that the contract's assets follow.
+  //
   // Note that there might be more UTxOs locked at the validator address; which
-  // is handled down below. Under normal use of the protocol, however, we
-  // should only ever see Ada and our minting policy.
+  // is why we can't simply look at assets under `from`, but must look the
+  // whole UTxO. Under normal use of the protocol, however, we should only ever
+  // see Ada and our minting policy.
   //
   // Anything else is treated as an anomaly and must be approved by the
-  // administrator. Note however that even the administrator can't take away
-  // the assets from the script.
-  let (from_lovelaces, from_assets, has_foreign) =
-    partition_assets(self.inputs, our_policy_id)
-
-  let authorize_special_operation =
-    if assets.lovelace_of(to) < from_lovelaces || has_foreign? {
-      must_be_approved_by_administrator(self, administrator)?
-    } else {
-      True
-    }
+  // administrator anyway. Note however that even the administrator can't take
+  // away the assets from the script.
+  let from_assets = total_value_restricted_by(self.inputs, our_policy_id)
 
   and {
-    authorize_special_operation?,
+    must_be_approved_by_administrator(self, administrator)?,
     (assets.without_lovelace(to) == from_assets)?,
   }
 }
@@ -102,39 +96,32 @@ pub fn must_forward_strict_assets(
   }
 }
 
-pub fn partition_assets(
+/// Compute the total value from a UTxO and a script hash restricted to:
+///
+/// - Assets owned by that script hash
+/// - Assets minted by that same script hash
+pub fn total_value_restricted_by(
   utxo: List<Input>,
   our_policy_id: PolicyId,
-) -> (Lovelace, Value, Bool) {
+) -> Value {
   list.foldr(
     utxo,
-    (0, assets.zero, False),
-    fn(input, (our_lovelaces, our_assets, has_foreign)) {
+    assets.zero,
+    fn(input, our_assets) {
       if input.output.address.payment_credential == Script(our_policy_id) {
         assets.reduce(
           input.output.value,
-          (our_lovelaces, our_assets, has_foreign),
-          fn(
-            policy_id,
-            asset_name,
-            quantity,
-            (our_lovelaces, our_assets, has_foreign),
-          ) {
-            if policy_id == ada_policy_id {
-              (our_lovelaces + quantity, our_assets, has_foreign)
-            } else if policy_id == our_policy_id {
-              (
-                our_lovelaces,
-                assets.add(our_assets, policy_id, asset_name, quantity),
-                has_foreign,
-              )
+          our_assets,
+          fn(policy_id, asset_name, quantity, our_assets) {
+            if policy_id == our_policy_id {
+              assets.add(our_assets, policy_id, asset_name, quantity)
             } else {
-              (our_lovelaces, our_assets, True)
+              our_assets
             }
           },
         )
       } else {
-        (our_lovelaces, our_assets, has_foreign)
+        our_assets
       }
     },
   )
